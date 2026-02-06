@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 
 from .diagnosis import diagnose_session
+from .doctor import run_doctor
 from .executor import execute_actions, run_prescription
 from .registry import PRESCRIPTIONS, STRATEGIES
 from .session import find_current_session, find_sessions, load_messages, resolve_session, save_messages
@@ -382,6 +383,58 @@ def _shell_quote(s: str) -> str:
     return "'" + s.replace("'", "'\\''") + "'"
 
 
+def cmd_doctor(args):
+    """Run health checks on Claude Code configuration and sessions."""
+    STATUS_ICONS = {
+        "ok": "✓",
+        "warning": "⚠",
+        "issue": "✗",
+        "fixed": "→",
+    }
+    STATUS_COLORS = {
+        "ok": "",
+        "warning": "",
+        "issue": "",
+        "fixed": "",
+    }
+
+    results = run_doctor(fix=args.fix)
+
+    print("\n  COZEMPIC DOCTOR")
+    print("  ═══════════════════════════════════════════════════════════════════")
+    print()
+
+    issues = 0
+    warnings = 0
+    fixed = 0
+
+    for r in results:
+        icon = STATUS_ICONS.get(r.status, "?")
+        print(f"    {icon} {r.name:<25} [{r.status.upper()}]")
+        print(f"      {r.message}")
+        if r.fix_description and r.status not in ("ok", "fixed"):
+            print(f"      Fix: {r.fix_description}")
+        print()
+
+        if r.status == "issue":
+            issues += 1
+        elif r.status == "warning":
+            warnings += 1
+        elif r.status == "fixed":
+            fixed += 1
+
+    # Summary
+    if fixed:
+        print(f"  Summary: {fixed} issue(s) fixed")
+    elif issues or warnings:
+        print(f"  Summary: {issues} issue(s), {warnings} warning(s)")
+        if not args.fix:
+            print("  Run 'cozempic doctor --fix' to auto-fix where possible.")
+    else:
+        print("  All clear — no issues found.")
+    print()
+
+
 def cmd_formulary(args):
     print("\n  COZEMPIC FORMULARY")
     print("  ═══════════════════════════════════════════════════════════════════")
@@ -456,6 +509,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_reload.add_argument("-rx", help="Prescription: gentle, standard, aggressive (default: standard)")
     p_reload.add_argument("--thinking-mode", choices=["remove", "truncate", "signature-only"])
 
+    # doctor
+    p_doctor = sub.add_parser("doctor", help="Check for known Claude Code issues and fix them")
+    p_doctor.add_argument("--fix", action="store_true", help="Auto-fix issues where possible")
+
     # formulary
     sub.add_parser("formulary", help="Show all strategies & prescriptions")
 
@@ -477,6 +534,7 @@ def main():
         "treat": cmd_treat,
         "strategy": cmd_strategy,
         "reload": cmd_reload,
+        "doctor": cmd_doctor,
         "formulary": cmd_formulary,
     }
 

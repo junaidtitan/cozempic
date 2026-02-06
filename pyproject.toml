@@ -31,9 +31,9 @@ classifiers = [
 cozempic = "cozempic.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/junaidtitan/cozempic"
-Repository = "https://github.com/junaidtitan/cozempic"
-Issues = "https://github.com/junaidtitan/cozempic/issues"
+Homepage = "https://github.com/Ruya-AI/cozempic"
+Repository = "https://github.com/Ruya-AI/cozempic"
+Issues = "https://github.com/Ruya-AI/cozempic/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]

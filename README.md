@@ -15,7 +15,7 @@ pip install cozempic
 Or run directly:
 
 ```bash
-git clone https://github.com/junaidtitan/cozempic.git
+git clone https://github.com/Ruya-AI/cozempic.git
 cd cozempic
 pip install -e .
 ```
@@ -87,10 +87,32 @@ cozempic diagnose <session>             Analyze bloat sources (read-only)
 cozempic treat <session> [-rx PRESET]   Run prescription (dry-run default)
 cozempic treat <session> --execute      Apply changes with backup
 cozempic strategy <name> <session>      Run single strategy
+cozempic reload [-rx PRESET]            Treat + auto-resume in new terminal
+cozempic doctor [--fix]                 Check for known Claude Code issues
 cozempic formulary                      Show all strategies & prescriptions
 ```
 
 Use `current` as the session argument in any command to auto-detect the active session for your working directory.
+
+## Doctor
+
+Beyond session pruning, Cozempic can check for known Claude Code configuration issues:
+
+```bash
+cozempic doctor        # Diagnose issues
+cozempic doctor --fix  # Auto-fix where possible
+```
+
+Current checks:
+
+| Check | What It Detects |
+|-------|----------------|
+| `trust-dialog-hang` | `hasTrustDialogAccepted=true` in `~/.claude.json` causing resume hangs on Windows |
+| `oversized-sessions` | Session files >50MB likely to hang on resume |
+| `stale-backups` | Old `.bak` files from previous treatments wasting disk |
+| `disk-usage` | Total session storage exceeding healthy thresholds |
+
+The `--fix` flag auto-applies fixes where safe (e.g., resetting the trust dialog flag, cleaning stale backups). Backups are created before any config modification.
 
 ## Claude Code Integration
 
