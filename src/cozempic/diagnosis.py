@@ -1,0 +1,75 @@
+"""Session diagnosis — analyze bloat sources in a session."""
+
+from __future__ import annotations
+
+import json
+import re
+
+from .helpers import get_content_blocks, get_msg_type, text_of
+from .types import Message
+
+
+def diagnose_session(messages: list[Message]) -> dict:
+    """Analyze a session and return bloat breakdown."""
+    total_bytes = sum(b for _, _, b in messages)
+    total_messages = len(messages)
+
+    type_stats: dict[str, dict] = {}
+    largest_messages: list[tuple[int, int, str, int]] = []
+
+    for pos, (idx, msg, size) in enumerate(messages):
+        mtype = get_msg_type(msg)
+        if mtype not in type_stats:
+            type_stats[mtype] = {"count": 0, "bytes": 0}
+        type_stats[mtype]["count"] += 1
+        type_stats[mtype]["bytes"] += size
+        largest_messages.append((size, idx, mtype, pos))
+
+    largest_messages.sort(reverse=True)
+
+    thinking_bytes = 0
+    signature_bytes = 0
+    tool_result_bytes = 0
+    progress_count = 0
+    file_history_count = 0
+    reminder_count = 0
+
+    reminder_pattern = re.compile(r"<system-reminder>.*?</system-reminder>", re.DOTALL)
+
+    for pos, (idx, msg, size) in enumerate(messages):
+        mtype = get_msg_type(msg)
+        if mtype == "progress":
+            progress_count += 1
+        if mtype == "file-history-snapshot":
+            file_history_count += 1
+
+        for block in get_content_blocks(msg):
+            btype = block.get("type", "")
+            if btype == "thinking":
+                thinking_bytes += len(json.dumps(block.get("thinking", "")).encode("utf-8"))
+                sig = block.get("signature", "")
+                if sig:
+                    signature_bytes += len(sig.encode("utf-8"))
+            elif btype == "tool_result":
+                content = block.get("content", "")
+                if isinstance(content, str):
+                    tool_result_bytes += len(content.encode("utf-8"))
+                elif isinstance(content, list):
+                    tool_result_bytes += len(json.dumps(content).encode("utf-8"))
+
+            text = text_of(block)
+            if text:
+                reminder_count += len(reminder_pattern.findall(text))
+
+    return {
+        "total_bytes": total_bytes,
+        "total_messages": total_messages,
+        "type_stats": type_stats,
+        "largest_messages": largest_messages[:10],
+        "thinking_bytes": thinking_bytes,
+        "signature_bytes": signature_bytes,
+        "tool_result_bytes": tool_result_bytes,
+        "progress_count": progress_count,
+        "file_history_count": file_history_count,
+        "reminder_count": reminder_count,
+    }
