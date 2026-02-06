@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import os
+import platform
+import subprocess
 import sys
 from pathlib import Path
 
@@ -250,6 +253,135 @@ def cmd_strategy(args):
     print()
 
 
+def cmd_reload(args):
+    """Treat the current session, then spawn a watcher that auto-resumes Claude."""
+    cwd = args.cwd or os.getcwd()
+    sess = find_current_session(cwd)
+    if not sess:
+        print("Could not detect current session.", file=sys.stderr)
+        print("Make sure you're running from a directory with a Claude Code project.", file=sys.stderr)
+        sys.exit(1)
+
+    rx_name = args.rx or "standard"
+    if rx_name not in PRESCRIPTIONS:
+        print(f"Error: Unknown prescription '{rx_name}'. Options: {', '.join(PRESCRIPTIONS)}", file=sys.stderr)
+        sys.exit(1)
+
+    # Step 1: Apply treatment
+    path = sess["path"]
+    messages = load_messages(path)
+    strategy_names = PRESCRIPTIONS[rx_name]
+    config = {}
+    if args.thinking_mode:
+        config["thinking_mode"] = args.thinking_mode
+
+    original_bytes = sum(b for _, _, b in messages)
+    original_count = len(messages)
+
+    new_messages, strategy_results = run_prescription(messages, strategy_names, config)
+    final_bytes = sum(b for _, _, b in new_messages)
+    final_count = len(new_messages)
+
+    pr = PrescriptionResult(
+        prescription_name=rx_name,
+        strategy_results=strategy_results,
+        original_total_bytes=original_bytes,
+        final_total_bytes=final_bytes,
+        original_message_count=original_count,
+        final_message_count=final_count,
+    )
+    print_prescription_result(pr)
+
+    backup = save_messages(path, new_messages, create_backup=True)
+    print(f"  Treatment applied to {path}")
+    if backup:
+        print(f"  Backup: {backup}")
+    print(f"  Final size: {fmt_bytes(final_bytes)}")
+    print()
+
+    # Step 2: Find Claude's parent PID and spawn watcher
+    claude_pid = _find_claude_pid()
+    if not claude_pid:
+        print("  WARNING: Could not detect Claude Code process.")
+        print("  Treatment was applied, but auto-resume watcher was NOT started.")
+        print("  Restart Claude manually with: claude --resume")
+        return
+
+    _spawn_watcher(claude_pid, cwd)
+    print(f"  Watcher spawned (watching Claude PID {claude_pid}).")
+    print(f"  Now type /exit — a new terminal will open with 'claude --resume'.")
+    print()
+
+
+def _find_claude_pid() -> int | None:
+    """Walk up the process tree to find the Claude Code node process."""
+    try:
+        pid = os.getpid()
+        for _ in range(10):  # walk up at most 10 levels
+            result = subprocess.run(
+                ["ps", "-o", "ppid=,comm=", "-p", str(pid)],
+                capture_output=True, text=True,
+            )
+            parts = result.stdout.strip().split(None, 1)
+            if len(parts) < 2:
+                break
+            ppid, comm = int(parts[0]), parts[1]
+            if "node" in comm.lower() or "claude" in comm.lower():
+                return pid  # return the pid we were checking (the claude process)
+            pid = ppid
+    except (ValueError, OSError):
+        pass
+    # Fallback: PPID is often Claude when invoked from within a session
+    ppid = os.getppid()
+    if ppid > 1:
+        return ppid
+    return None
+
+
+def _spawn_watcher(claude_pid: int, project_dir: str):
+    """Spawn a detached background process that waits for Claude to exit, then resumes."""
+    system = platform.system()
+
+    if system == "Darwin":
+        resume_cmd = (
+            f"osascript -e 'tell application \"Terminal\" to do script "
+            f"\"cd {_shell_quote(project_dir)} && claude --resume\"'"
+        )
+    elif system == "Linux":
+        # Try common terminal emulators
+        resume_cmd = (
+            f"if command -v gnome-terminal >/dev/null 2>&1; then "
+            f"gnome-terminal -- bash -c 'cd {_shell_quote(project_dir)} && claude --resume; exec bash'; "
+            f"elif command -v xterm >/dev/null 2>&1; then "
+            f"xterm -e 'cd {_shell_quote(project_dir)} && claude --resume' & "
+            f"else echo 'No terminal emulator found' >> /tmp/cozempic_reload.log; fi"
+        )
+    else:
+        print(f"  WARNING: Auto-resume not supported on {system}.")
+        print(f"  Restart manually: cd {project_dir} && claude --resume")
+        return
+
+    watcher_script = (
+        f"while kill -0 {claude_pid} 2>/dev/null; do sleep 1; done; "
+        f"sleep 1; "
+        f"{resume_cmd}; "
+        f"echo \"$(date): Cozempic resumed Claude in {project_dir}\" >> /tmp/cozempic_reload.log"
+    )
+
+    subprocess.Popen(
+        ["bash", "-c", watcher_script],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,  # fully detach from parent
+    )
+
+
+def _shell_quote(s: str) -> str:
+    """Single-quote a string for shell use."""
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
 def cmd_formulary(args):
     print("\n  COZEMPIC FORMULARY")
     print("  ═══════════════════════════════════════════════════════════════════")
@@ -318,6 +450,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_strat.add_argument("--project", help="Filter by project name")
     p_strat.add_argument("--thinking-mode", choices=["remove", "truncate", "signature-only"])
 
+    # reload
+    p_reload = sub.add_parser("reload", help="Treat current session and auto-resume after exit")
+    p_reload.add_argument("--cwd", help="Working directory (default: current)")
+    p_reload.add_argument("-rx", help="Prescription: gentle, standard, aggressive (default: standard)")
+    p_reload.add_argument("--thinking-mode", choices=["remove", "truncate", "signature-only"])
+
     # formulary
     sub.add_parser("formulary", help="Show all strategies & prescriptions")
 
@@ -338,6 +476,7 @@ def main():
         "diagnose": cmd_diagnose,
         "treat": cmd_treat,
         "strategy": cmd_strategy,
+        "reload": cmd_reload,
         "formulary": cmd_formulary,
     }
 
