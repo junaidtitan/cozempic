@@ -1,6 +1,6 @@
 # Cozempic
 
-Context cleaning for [Claude Code](https://claude.ai/code) — **remove the bloat, keep everything that matters**.
+Context cleaning for [Claude Code](https://claude.ai/code) — **remove the bloat, keep everything that matters, protect Agent Teams from context loss**.
 
 ### What gets removed
 
@@ -10,7 +10,11 @@ Claude Code context fills up with dead weight that wastes your token budget: hun
 
 When context gets too large, Claude's auto-compaction summarizes away critical state. For **Agent Teams**, this is catastrophic: the lead agent's context is compacted, team coordination messages (TeamCreate, SendMessage, TaskCreate/Update) are discarded, the lead forgets its teammates exist, and subagents are orphaned with no recovery path. ([#23620](https://github.com/anthropics/claude-code/issues/23620), [#23821](https://github.com/anthropics/claude-code/issues/23821), [#24052](https://github.com/anthropics/claude-code/issues/24052), [#21925](https://github.com/anthropics/claude-code/issues/21925))
 
-Cozempic's **guard mode** prevents this entirely — a background daemon that continuously cleans dead weight so auto-compaction never triggers, while protecting every team message and automatically repairing team state if context is reset.
+Cozempic prevents this with three layers of protection:
+
+1. **Continuous checkpoint** — saves team state to disk every N seconds so it's always recoverable
+2. **Hook-driven checkpoint** — fires after every Task spawn, TaskCreate/Update, before compaction, and at session end
+3. **Emergency prune** — at a configurable size threshold, prunes dead weight with team-protect, injects recovery messages, and optionally reloads Claude
 
 **Zero external dependencies.** Python 3.10+ stdlib only.
 
@@ -46,8 +50,14 @@ cozempic treat current --execute
 # Go aggressive on a specific session
 cozempic treat <session_id> -rx aggressive --execute
 
-# Keep context clean automatically — protect Agent Teams (run in a separate terminal)
+# Save team/agent state right now (no pruning, instant)
+cozempic checkpoint --show
+
+# Keep context clean automatically — run in a separate terminal
 cozempic guard --threshold 50 -rx standard
+
+# Treat + auto-resume in a new terminal
+cozempic reload -rx gentle
 ```
 
 Session IDs accept full UUIDs, UUID prefixes, file paths, or `current` for auto-detection based on your working directory.
@@ -99,43 +109,198 @@ cozempic treat <session> [-rx PRESET]   Run prescription (dry-run default)
 cozempic treat <session> --execute      Apply changes with backup
 cozempic strategy <name> <session>      Run single strategy
 cozempic reload [-rx PRESET]            Treat + auto-resume in new terminal
-cozempic guard [--threshold MB]         Protect & repair Agent Teams context (background)
+cozempic checkpoint [--show]            Save team/agent state to disk (no pruning)
+cozempic guard [--threshold MB]         Continuous checkpoint + emergency prune (background)
 cozempic doctor [--fix]                 Check for known Claude Code issues
 cozempic formulary                      Show all strategies & prescriptions
 ```
 
 Use `current` as the session argument in any command to auto-detect the active session for your working directory.
 
-## Guard — Agent Teams Context Loss Protection & Repair
+## Checkpoint — Instant Team State Snapshot
 
-Guard is a background daemon that **protects** and **repairs** Agent Teams context. Run it in a separate terminal and forget about it.
+Save your current team/agent state to disk without pruning or modifying anything:
 
 ```bash
-# Protect Agent Teams — run in a separate terminal
-cozempic guard --threshold 50 -rx standard
+# Save team state
+cozempic checkpoint
+
+# Save and print the state
+cozempic checkpoint --show
+```
+
+Output:
+
+```
+  Checkpoint: 6 subagents, 9 tasks -> team-checkpoint.md
+
+Active agent team: agents
+
+Subagents (6):
+  - af9763f [Explore] — Explore memory system [completed]
+    Result: Complete understanding of the memory system...
+  - aa79e90 [Explore] — Explore platform adapters [completed]
+    Result: Comprehensive technical summary of platform...
+  ...
+
+Shared task list:
+  - [COMPLETED] Fix team detection
+  - [IN_PROGRESS] Add continuous checkpoint
+  - [PENDING] Update README
+```
+
+### What gets detected
+
+Cozempic scans the JSONL session file for all team coordination patterns:
+
+| Pattern | Source | What's Extracted |
+|---------|--------|-----------------|
+| `Task` tool calls | Subagent spawns | agent_id, subagent_type, description, prompt |
+| `<task-notification>` | Agent completion messages | status, summary, full result text |
+| `TaskCreate` / `TaskUpdate` | Shared todo list | task_id, subject, status, owner |
+| `TaskOutput` / `TaskStop` | Background agent management | agent status updates |
+| `TeamCreate` / `SendMessage` | Explicit team coordination | team name, teammate roles |
+
+The checkpoint is written to `.claude/projects/<project>/team-checkpoint.md`.
+
+## Guard — Continuous Protection
+
+Guard is a background daemon with two phases:
+
+**Phase 1: Continuous checkpoint** (every interval) — extracts team state and writes to disk. Lightweight read-only scan. Team state is always recoverable even if Claude crashes.
+
+**Phase 2: Emergency prune** (at threshold) — when file size crosses the threshold, prunes dead weight with team-protect, injects recovery messages into the JSONL, and optionally kills + resumes Claude.
+
+```bash
+# Standard — run in a separate terminal
+cozempic guard
+
+# Custom threshold and interval
+cozempic guard --threshold 30 --interval 15 -rx standard
 
 # Without auto-reload (just clean, no restart)
 cozempic guard --threshold 50 --no-reload
-
-# Lower threshold, faster checks
-cozempic guard --threshold 30 --interval 15
 ```
 
-**Protection** — prevents context loss before it happens:
+Output:
 
-1. Monitors context size every 30 seconds
-2. When the threshold is approached, cleans dead weight using the same strategies as `treat`
-3. Team coordination messages (TeamCreate, SendMessage, TaskCreate/Update) are **never removed**
-4. Context stays under threshold — auto-compaction never fires
+```
+  COZEMPIC GUARD v2
+  ===================================================================
+  Session:     abc123.jsonl
+  Size:        5.4MB
+  Threshold:   50.0MB (emergency prune)
+  Rx:          standard
+  Interval:    30s
+  Checkpoint:  continuous (every 30s)
 
-**Repair** — recovers team state if context is reset:
+  Guarding... (Ctrl+C to stop)
 
-5. Before cleaning, **extracts full team state** — teammates, tasks, roles, coordination history
-6. Writes a crash-safe checkpoint to `.claude/team-checkpoint.md`
-7. **Injects team state directly into the context** as a synthetic message pair — Claude *sees* the team as conversation history when it resumes (force-read, not a suggestion)
-8. Triggers auto-reload (kill + resume in new terminal) so Claude picks up the clean context with team state intact
+  [14:23:01] Checkpoint #1: 6 agents, 9 tasks, 121 msgs (5.4MB)
+  [14:25:31] Checkpoint #2: 8 agents, 12 tasks, 156 msgs (6.1MB)
+  [14:28:01] Checkpoint #3: 8 agents, 12 tasks, 189 msgs (7.2MB)
+```
 
-**The result:** Your context stays clean. Everything valuable is preserved — conversation history, decisions, tool results, and full Agent Teams coordination. Auto-compaction never fires. No orphaned subagents, no lost context.
+On Ctrl+C, guard writes a final checkpoint before exiting.
+
+### How team-protect works
+
+During emergency prune:
+
+1. **Extract** full team state (subagents, tasks, teammates, coordination history)
+2. **Separate** team messages from non-team messages
+3. **Prune** only non-team messages using the prescription
+4. **Merge** team messages back at their original positions
+5. **Inject** a synthetic message pair confirming team state (Claude *sees* this as conversation history)
+6. **Save** with backup, then optionally reload
+
+## Hook Integration
+
+For the strongest protection, wire `cozempic checkpoint` into Claude Code hooks. This captures team state at every critical moment — not just on a timer.
+
+Add to your project's `.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cozempic checkpoint 2>/dev/null || true"
+          }
+        ]
+      },
+      {
+        "matcher": "TaskCreate|TaskUpdate",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cozempic checkpoint 2>/dev/null || true"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cozempic checkpoint 2>/dev/null || true"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cozempic checkpoint 2>/dev/null || true"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+This checkpoints team state:
+
+| Hook | When | Why |
+|------|------|-----|
+| `PostToolUse[Task]` | After every subagent spawn | Capture new agent immediately |
+| `PostToolUse[TaskCreate\|TaskUpdate]` | After todo list changes | Track task progress |
+| `PreCompact` | Right before auto-compaction | Last chance to save state |
+| `Stop` | Session end | Final checkpoint |
+
+### Protection layers summary
+
+| Layer | Trigger | What it does |
+|-------|---------|-------------|
+| **Hooks** | Every Task/TaskCreate/TaskUpdate, PreCompact, Stop | Instant checkpoint to disk |
+| **Guard** | Every N seconds | Continuous checkpoint + emergency prune at threshold |
+| **Reload** | Manual (`cozempic reload`) | One-shot prune + auto-resume |
+| **Checkpoint** | Manual (`cozempic checkpoint`) | One-shot state save |
+
+## Reload — Treat + Auto-Resume
+
+Prune the current session and automatically resume Claude in a new terminal:
+
+```bash
+cozempic reload -rx gentle
+```
+
+This:
+1. Treats the current session with the chosen prescription
+2. Generates a compact recap of the conversation
+3. Spawns a watcher that waits for Claude to exit
+4. When you type `/exit`, a new terminal opens with `claude --resume`
+5. The recap is displayed before the resume prompt
 
 ## Doctor
 
@@ -207,7 +372,8 @@ This makes `$CLAUDE_SESSION_ID` available in all Bash commands during the sessio
 - **Timestamped backups** — automatic `.bak` files before any modification
 - **Never touches uuid/parentUuid** — conversation DAG stays intact
 - **Never removes summary/queue-operation messages** — structurally important
-- **Team messages are protected** — guard mode never prunes TeamCreate, SendMessage, TaskCreate/Update
+- **Team messages are protected** — guard and checkpoint never prune Task, TaskCreate, TaskUpdate, TeamCreate, or SendMessage tool calls
+- **task-notification results preserved** — agent completion results (the actual output) are captured and checkpointed
 - **Strategies compose sequentially** — each runs on the output of the previous, so savings are accurate and don't overlap
 
 ## Example Output

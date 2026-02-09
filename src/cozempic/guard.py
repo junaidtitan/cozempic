@@ -1,15 +1,17 @@
-"""Guard daemon — monitors session size and auto-prunes before compaction.
+"""Guard daemon — continuous team checkpointing + emergency prune.
 
-Runs as a background process that watches the active session JSONL file.
-When the file crosses a configurable threshold, it:
-1. Extracts team state from the conversation
-2. Writes a checkpoint to disk
-3. Prunes the session with team-protect
-4. Injects team state recovery messages
-5. Kills the Claude process and auto-resumes in a new terminal
+Architecture:
+  EVERY interval:  Extract team state → write checkpoint (lightweight, no prune)
+  AT threshold:    Prune non-team messages → inject recovery → optionally reload
 
-This prevents auto-compaction from ever triggering, which means
-agent team state is never lost.
+The checkpoint runs continuously so team state is ALWAYS on disk, regardless
+of whether the threshold is ever hit. The threshold prune is the emergency
+fallback — not the primary protection mechanism.
+
+Checkpoint triggers:
+  1. Every N seconds (guard daemon)
+  2. On demand via `cozempic checkpoint` (hook-driven)
+  3. At file size threshold (emergency prune)
 """
 
 from __future__ import annotations
@@ -27,12 +29,57 @@ from .session import find_current_session, load_messages, save_messages
 from .team import TeamState, extract_team_state, inject_team_recovery, write_team_checkpoint
 
 
+# ─── Lightweight checkpoint (no prune) ───────────────────────────────────────
+
+def checkpoint_team(
+    cwd: str | None = None,
+    session_path: Path | None = None,
+    quiet: bool = False,
+) -> TeamState | None:
+    """Extract and save team state from the current session. No pruning.
+
+    This is fast and safe — it only reads the JSONL and writes a checkpoint.
+    Designed to be called from hooks, guard daemon, or CLI.
+
+    Returns the extracted TeamState, or None if no session found.
+    """
+    if session_path is None:
+        sess = find_current_session(cwd)
+        if not sess:
+            if not quiet:
+                print("  No active session found.", file=sys.stderr)
+            return None
+        session_path = sess["path"]
+
+    messages = load_messages(session_path)
+    state = extract_team_state(messages)
+
+    if state.is_empty():
+        if not quiet:
+            print("  No team state detected.")
+        return state
+
+    project_dir = session_path.parent
+    cp_path = write_team_checkpoint(state, project_dir)
+
+    if not quiet:
+        agents = len(state.subagents)
+        teammates = len(state.teammates)
+        tasks = len(state.tasks)
+        parts = []
+        if agents:
+            parts.append(f"{agents} subagents")
+        if teammates:
+            parts.append(f"{teammates} teammates")
+        if tasks:
+            parts.append(f"{tasks} tasks")
+        summary = ", ".join(parts) if parts else "empty"
+        print(f"  Checkpoint: {summary} → {cp_path.name}")
+
+    return state
+
+
 # ─── Team-aware pruning ──────────────────────────────────────────────────────
-
-def _is_team_message_by_index(messages, team_indices: set[int]):
-    """Build a set of line indices that are team-related."""
-    return team_indices
-
 
 def prune_with_team_protect(
     messages: list,
@@ -99,8 +146,12 @@ def start_guard(
 ) -> None:
     """Start the guard daemon.
 
-    Monitors the current session's JSONL file and auto-prunes
-    when it crosses the size threshold.
+    Two-phase protection:
+      1. CHECKPOINT every interval — extract team state, write to disk
+      2. PRUNE at threshold — emergency prune with team-protect
+
+    The checkpoint is lightweight (read-only scan + write checkpoint file).
+    Pruning only happens when the file size crosses the threshold.
 
     Args:
         cwd: Working directory for session detection.
@@ -121,59 +172,88 @@ def start_guard(
 
     session_path = sess["path"]
 
-    print(f"\n  COZEMPIC GUARD")
+    print(f"\n  COZEMPIC GUARD v2")
     print(f"  ═══════════════════════════════════════════════════════════════════")
-    print(f"  Session:   {session_path.name}")
-    print(f"  Size:      {sess['size'] / 1024 / 1024:.1f}MB")
-    print(f"  Threshold: {threshold_mb}MB")
-    print(f"  Rx:        {rx_name}")
-    print(f"  Interval:  {interval}s")
-    print(f"  Reload:    {'yes' if auto_reload else 'no'}")
+    print(f"  Session:     {session_path.name}")
+    print(f"  Size:        {sess['size'] / 1024 / 1024:.1f}MB")
+    print(f"  Threshold:   {threshold_mb}MB (emergency prune)")
+    print(f"  Rx:          {rx_name}")
+    print(f"  Interval:    {interval}s")
+    print(f"  Reload:      {'yes' if auto_reload else 'no'}")
     print(f"  Team-protect: enabled")
+    print(f"  Checkpoint:  continuous (every {interval}s)")
     print(f"\n  Guarding... (Ctrl+C to stop)")
     print()
 
     prune_count = 0
+    checkpoint_count = 0
+    last_team_hash = ""
 
     try:
         while True:
             time.sleep(interval)
 
-            # Re-check file size
+            # Re-check file exists
             if not session_path.exists():
                 print("  WARNING: Session file disappeared. Stopping guard.")
                 break
 
             current_size = session_path.stat().st_size
 
-            if current_size < threshold_bytes:
-                continue
-
-            # Threshold crossed — prune!
-            prune_count += 1
-            size_mb = current_size / 1024 / 1024
-            print(f"  [{_now()}] Threshold crossed: {size_mb:.1f}MB > {threshold_mb}MB")
-            print(f"  Pruning (cycle #{prune_count})...")
-
-            result = guard_prune_cycle(
+            # ── Phase 1: Continuous checkpoint ────────────────────────
+            state = checkpoint_team(
                 session_path=session_path,
-                rx_name=rx_name,
-                config=config,
-                auto_reload=auto_reload,
-                cwd=cwd or os.getcwd(),
+                quiet=True,
             )
 
-            if result.get("reloading"):
-                print(f"  Reload triggered. Guard exiting.")
-                break
+            # Only log if team state changed
+            if state and not state.is_empty():
+                team_hash = f"{len(state.subagents)}:{len(state.tasks)}:{state.message_count}"
+                if team_hash != last_team_hash:
+                    checkpoint_count += 1
+                    last_team_hash = team_hash
+                    agents = len(state.subagents)
+                    tasks = len(state.tasks)
+                    size_mb = current_size / 1024 / 1024
+                    print(
+                        f"  [{_now()}] Checkpoint #{checkpoint_count}: "
+                        f"{agents} agents, {tasks} tasks, "
+                        f"{state.message_count} msgs "
+                        f"({size_mb:.1f}MB)"
+                    )
 
-            print(f"  Pruned: {result['saved_mb']:.1f}MB saved")
-            if result.get("team_name"):
-                print(f"  Team '{result['team_name']}' state preserved ({result['team_messages']} messages)")
-            print()
+            # ── Phase 2: Emergency prune at threshold ─────────────────
+            if current_size >= threshold_bytes:
+                prune_count += 1
+                size_mb = current_size / 1024 / 1024
+                print(f"  [{_now()}] THRESHOLD CROSSED: {size_mb:.1f}MB > {threshold_mb}MB")
+                print(f"  Emergency prune (cycle #{prune_count})...")
+
+                result = guard_prune_cycle(
+                    session_path=session_path,
+                    rx_name=rx_name,
+                    config=config,
+                    auto_reload=auto_reload,
+                    cwd=cwd or os.getcwd(),
+                )
+
+                if result.get("reloading"):
+                    print(f"  Reload triggered. Guard exiting.")
+                    break
+
+                print(f"  Pruned: {result['saved_mb']:.1f}MB saved")
+                if result.get("team_name"):
+                    print(
+                        f"  Team '{result['team_name']}' state preserved "
+                        f"({result['team_messages']} messages)"
+                    )
+                print()
 
     except KeyboardInterrupt:
-        print("\n  Guard stopped.")
+        # Final checkpoint before exit
+        print(f"\n  [{_now()}] Final checkpoint before exit...")
+        checkpoint_team(session_path=session_path, quiet=False)
+        print(f"  Guard stopped. {checkpoint_count} checkpoints, {prune_count} prunes.")
 
 
 def guard_prune_cycle(

@@ -12,7 +12,7 @@ from pathlib import Path
 from .diagnosis import diagnose_session
 from .doctor import run_doctor
 from .executor import execute_actions, run_prescription
-from .guard import start_guard
+from .guard import checkpoint_team, start_guard
 from .recap import save_recap
 from .registry import PRESCRIPTIONS, STRATEGIES
 from .session import find_current_session, find_sessions, load_messages, resolve_session, save_messages
@@ -397,6 +397,16 @@ def _shell_quote(s: str) -> str:
     return "'" + s.replace("'", "'\\''") + "'"
 
 
+def cmd_checkpoint(args):
+    """Save team/agent state from the current session. No pruning."""
+    state = checkpoint_team(cwd=args.cwd or os.getcwd())
+    if state and not state.is_empty():
+        if args.show:
+            print()
+            print(state.to_recovery_text())
+            print()
+
+
 def cmd_guard(args):
     """Start the guard daemon to prevent compaction-induced state loss."""
     start_guard(
@@ -534,6 +544,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_reload.add_argument("-rx", help="Prescription: gentle, standard, aggressive (default: standard)")
     p_reload.add_argument("--thinking-mode", choices=["remove", "truncate", "signature-only"])
 
+    # checkpoint
+    p_cp = sub.add_parser("checkpoint", help="Save team/agent state from the current session (no pruning)")
+    p_cp.add_argument("--cwd", help="Working directory (default: current)")
+    p_cp.add_argument("--show", action="store_true", help="Print the team state after saving")
+
     # guard
     p_guard = sub.add_parser("guard", help="Background sentinel — auto-prune before compaction triggers")
     p_guard.add_argument("--cwd", help="Working directory (default: current)")
@@ -567,6 +582,7 @@ def main():
         "treat": cmd_treat,
         "strategy": cmd_strategy,
         "reload": cmd_reload,
+        "checkpoint": cmd_checkpoint,
         "guard": cmd_guard,
         "doctor": cmd_doctor,
         "formulary": cmd_formulary,

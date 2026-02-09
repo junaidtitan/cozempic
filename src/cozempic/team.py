@@ -1,9 +1,14 @@
 """Agent team state extraction, checkpointing, and recovery injection.
 
-Scans JSONL session files for agent team coordination patterns
-(TeamCreate, SendMessage, TaskCreate, TaskUpdate, teammate references)
-and can inject team state back into a pruned session so that
-Claude resumes with full team awareness.
+Scans JSONL session files for agent team coordination patterns:
+- Task tool calls (subagent spawns with subagent_type, prompt, description)
+- task-notification messages (actual agent results, status, summaries)
+- TaskCreate/TaskUpdate/TaskList/TaskGet (shared todo list)
+- TaskOutput (background agent results)
+- TeamCreate/SendMessage (explicit team coordination)
+
+Injects team state back into a pruned session so that Claude resumes
+with full team awareness.
 """
 
 from __future__ import annotations
@@ -19,8 +24,19 @@ from .types import Message
 
 
 @dataclass
+class SubagentInfo:
+    """Information about a spawned subagent (Task tool call)."""
+
+    agent_id: str
+    description: str = ""
+    subagent_type: str = ""
+    status: str = "running"  # running, completed, failed
+    result_summary: str = ""
+
+
+@dataclass
 class TeammateInfo:
-    """Information about a single teammate."""
+    """Information about a named teammate (explicit team)."""
 
     agent_id: str
     name: str
@@ -45,13 +61,19 @@ class TeamState:
 
     team_name: str = ""
     teammates: list[TeammateInfo] = field(default_factory=list)
+    subagents: list[SubagentInfo] = field(default_factory=list)
     tasks: list[TaskInfo] = field(default_factory=list)
     lead_summary: str = ""
     message_count: int = 0
     last_coordination_index: int = -1
 
     def is_empty(self) -> bool:
-        return not self.team_name and not self.teammates and not self.tasks
+        return (
+            not self.team_name
+            and not self.teammates
+            and not self.subagents
+            and not self.tasks
+        )
 
     def to_markdown(self) -> str:
         """Render team state as markdown for checkpoint file."""
@@ -66,6 +88,16 @@ class TeamState:
                 status = f" ({t.status})" if t.status != "unknown" else ""
                 role = f" — {t.role}" if t.role else ""
                 lines.append(f"- **{t.name}** (`{t.agent_id}`){role}{status}")
+            lines.append("")
+
+        if self.subagents:
+            lines.append("## Subagents")
+            for s in self.subagents:
+                agent_type = f" [{s.subagent_type}]" if s.subagent_type else ""
+                desc = f" — {s.description}" if s.description else ""
+                lines.append(f"- `{s.agent_id}`{agent_type}{desc} ({s.status})")
+                if s.result_summary:
+                    lines.append(f"  Result: {s.result_summary[:200]}")
             lines.append("")
 
         if self.tasks:
@@ -84,7 +116,8 @@ class TeamState:
             lines.append(self.lead_summary)
             lines.append("")
 
-        lines.append(f"_Extracted from {self.message_count} team-related messages_")
+        total = self.message_count
+        lines.append(f"_Extracted from {total} team-related messages_")
         return "\n".join(lines)
 
     def to_recovery_text(self) -> str:
@@ -97,6 +130,15 @@ class TeamState:
             for t in self.teammates:
                 role = f" — {t.role}" if t.role else ""
                 parts.append(f"  - {t.name} (agent_id: {t.agent_id}){role} [{t.status}]")
+
+        if self.subagents:
+            parts.append(f"\nSubagents ({len(self.subagents)}):")
+            for s in self.subagents:
+                agent_type = f" [{s.subagent_type}]" if s.subagent_type else ""
+                desc = f" — {s.description}" if s.description else ""
+                parts.append(f"  - {s.agent_id}{agent_type}{desc} [{s.status}]")
+                if s.result_summary:
+                    parts.append(f"    Result: {s.result_summary[:150]}")
 
         if self.tasks:
             parts.append("\nShared task list:")
@@ -112,23 +154,55 @@ class TeamState:
 
 # ─── Patterns for team message detection ─────────────────────────────────────
 
+# Tool names that indicate team/agent coordination
 TEAM_TOOL_NAMES = {
+    # Explicit team coordination
     "TeamCreate", "TeamDelete", "TeamMessage", "SendMessage",
-    "TaskCreate", "TaskUpdate", "TaskList", "TaskGet",
     "SpawnTeammate", "TeamStatus",
+    # Shared task list (todo tracking)
+    "TaskCreate", "TaskUpdate", "TaskList", "TaskGet",
+    # Subagent spawning and results (Claude Code's Task tool)
+    "Task", "TaskOutput", "TaskStop",
 }
 
+# Keyword patterns for detecting team-related content in text/results
 TEAM_KEYWORDS = re.compile(
     r"team.?name|agent.?id|teammate|team.?lead|"
     r"SendMessage|TeamCreate|TaskCreate|TaskUpdate|"
-    r"agent.?team|spawn.+teammate|team.+config",
+    r"agent.?team|spawn.+teammate|team.+config|"
+    r"subagent_type|run_in_background|resume.*agent",
+    re.IGNORECASE,
+)
+
+# Patterns for parsing task-notification XML in user messages
+_TASK_NOTIFICATION_RE = re.compile(
+    r"<task-notification>\s*"
+    r"<task-id>([^<]+)</task-id>\s*"
+    r"<status>([^<]+)</status>\s*"
+    r"<summary>([^<]*)</summary>\s*"
+    r"<result>(.*?)</result>",
+    re.DOTALL,
+)
+
+# Pattern for agent progress notifications in system-reminder tags
+_AGENT_PROGRESS_RE = re.compile(
+    r"Agent\s+([a-f0-9]+)\s+progress:.*?(\d+)\s+new\s+tool",
     re.IGNORECASE,
 )
 
 
 def _is_team_message(msg_dict: dict) -> bool:
-    """Check if a message is related to agent team coordination."""
-    # Check tool_use blocks
+    """Check if a message is related to agent team coordination.
+
+    Detects:
+    - Task tool calls (subagent spawns)
+    - task-notification messages (agent completion results)
+    - TaskCreate/Update/List/Get (todo list)
+    - TaskOutput/TaskStop (background agent management)
+    - TeamCreate/SendMessage (explicit teams)
+    - Tool results from any of the above
+    - Text mentioning team coordination keywords
+    """
     inner = msg_dict.get("message", {})
     content = inner.get("content", [])
 
@@ -136,21 +210,57 @@ def _is_team_message(msg_dict: dict) -> bool:
         for block in content:
             if not isinstance(block, dict):
                 continue
+
+            block_type = block.get("type", "")
+
             # Tool use with team-related name
-            if block.get("type") == "tool_use" and block.get("name") in TEAM_TOOL_NAMES:
+            if block_type == "tool_use" and block.get("name") in TEAM_TOOL_NAMES:
                 return True
-            # Tool result containing team data
-            if block.get("type") == "tool_result":
+
+            # Tool result — check both name reference and content
+            if block_type == "tool_result":
                 result_content = block.get("content", "")
                 if isinstance(result_content, str) and TEAM_KEYWORDS.search(result_content):
                     return True
-            # Text mentioning team coordination
-            text = block.get("text", "")
-            if isinstance(text, str) and TEAM_KEYWORDS.search(text):
-                return True
+                if isinstance(result_content, list):
+                    for sub in result_content:
+                        if isinstance(sub, dict):
+                            text = sub.get("text", "")
+                            if isinstance(text, str) and TEAM_KEYWORDS.search(text):
+                                return True
 
-    elif isinstance(content, str) and TEAM_KEYWORDS.search(content):
-        return True
+            # Text mentioning team coordination
+            if block_type == "text":
+                text = block.get("text", "")
+                if isinstance(text, str) and TEAM_KEYWORDS.search(text):
+                    return True
+
+    elif isinstance(content, str):
+        # task-notification XML in user messages (agent results)
+        if "<task-notification>" in content:
+            return True
+        if TEAM_KEYWORDS.search(content):
+            return True
+
+    return False
+
+
+def _is_task_tool_result(msg_dict: dict, pending_task_ids: set[str]) -> bool:
+    """Check if a message contains a tool_result for a Task tool call.
+
+    Task tool results carry the agent's output — these are critical to preserve.
+    """
+    inner = msg_dict.get("message", {})
+    content = inner.get("content", [])
+
+    if isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_result":
+                tool_use_id = block.get("tool_use_id", "")
+                if tool_use_id in pending_task_ids:
+                    return True
 
     return False
 
@@ -159,15 +269,22 @@ def extract_team_state(messages: list[Message]) -> TeamState:
     """Scan messages for team coordination patterns and extract state.
 
     Looks for:
+    - Task tool calls (subagent spawns with subagent_type, prompt, description)
+    - TaskOutput calls (checking on background agents)
     - TeamCreate tool calls (team name, teammate configs)
     - SendMessage / TeamMessage tool calls
-    - TaskCreate / TaskUpdate tool calls
+    - TaskCreate / TaskUpdate tool calls (shared todo list)
     - Teammate spawn details (agent IDs, roles)
-    - Task list state
     """
     state = TeamState()
-    seen_teammates = {}  # agent_id -> TeammateInfo
-    seen_tasks = {}  # task_id -> TaskInfo
+    seen_teammates: dict[str, TeammateInfo] = {}
+    seen_subagents: dict[str, SubagentInfo] = {}
+    seen_tasks: dict[str, TaskInfo] = {}
+
+    # Track tool_use_id -> tool_name for matching results to calls
+    tool_use_id_to_name: dict[str, str] = {}
+    # Track tool_use_id -> subagent key for Task tool results
+    tool_use_id_to_subagent: dict[str, str] = {}
 
     for line_idx, msg, byte_size in messages:
         if not _is_team_message(msg):
@@ -185,75 +302,185 @@ def extract_team_state(messages: list[Message]) -> TeamState:
             if not isinstance(block, dict):
                 continue
 
-            if block.get("type") != "tool_use":
-                continue
+            block_type = block.get("type", "")
 
-            name = block.get("name", "")
-            inp = block.get("input", {})
+            # ── Tool use blocks ──────────────────────────────────────
+            if block_type == "tool_use":
+                name = block.get("name", "")
+                inp = block.get("input", {})
+                tool_use_id = block.get("id", "")
 
-            if name == "TeamCreate":
-                state.team_name = inp.get("name", state.team_name)
-                for tm in inp.get("teammates", []):
-                    agent_id = tm.get("agentId", tm.get("agent_id", ""))
-                    tm_name = tm.get("name", agent_id)
-                    role = tm.get("role", tm.get("description", ""))
-                    if agent_id:
-                        seen_teammates[agent_id] = TeammateInfo(
-                            agent_id=agent_id,
-                            name=tm_name,
-                            role=role,
-                            status="running",
-                        )
+                if tool_use_id and name:
+                    tool_use_id_to_name[tool_use_id] = name
 
-            elif name in ("TaskCreate",):
-                task_id = inp.get("taskId", inp.get("id", str(len(seen_tasks))))
-                subject = inp.get("subject", inp.get("title", ""))
-                seen_tasks[task_id] = TaskInfo(
-                    task_id=task_id,
-                    subject=subject,
-                    status="pending",
-                    owner=inp.get("owner", ""),
-                    description=inp.get("description", ""),
-                )
+                # Task tool = subagent spawn
+                if name == "Task":
+                    description = inp.get("description", "")
+                    subagent_type = inp.get("subagent_type", "")
+                    prompt = inp.get("prompt", "")[:200]
+                    resume_id = inp.get("resume", "")
+                    bg = inp.get("run_in_background", False)
 
-            elif name in ("TaskUpdate",):
-                task_id = inp.get("taskId", inp.get("id", ""))
-                if task_id in seen_tasks:
-                    if inp.get("status"):
-                        seen_tasks[task_id].status = inp["status"]
-                    if inp.get("owner"):
-                        seen_tasks[task_id].owner = inp["owner"]
-                else:
-                    # Task created before our scan window
+                    # Use tool_use_id as temporary key until we get agent_id
+                    key = resume_id or tool_use_id or f"task-{len(seen_subagents)}"
+                    agent = SubagentInfo(
+                        agent_id=key,
+                        description=description or prompt[:80],
+                        subagent_type=subagent_type,
+                        status="running" if bg else "running",
+                    )
+                    seen_subagents[key] = agent
+                    if tool_use_id:
+                        tool_use_id_to_subagent[tool_use_id] = key
+
+                    # Infer team name from subagent_type if not set
+                    if not state.team_name and subagent_type:
+                        state.team_name = f"agents"
+
+                # TaskOutput = checking on background agent
+                elif name == "TaskOutput":
+                    task_id = inp.get("task_id", "")
+                    if task_id and task_id in seen_subagents:
+                        # Still running, waiting for result
+                        pass
+
+                # TaskStop = stopping a background agent
+                elif name == "TaskStop":
+                    task_id = inp.get("task_id", "")
+                    if task_id and task_id in seen_subagents:
+                        seen_subagents[task_id].status = "stopped"
+
+                # TeamCreate (explicit team)
+                elif name == "TeamCreate":
+                    state.team_name = inp.get("name", state.team_name)
+                    for tm in inp.get("teammates", []):
+                        agent_id = tm.get("agentId", tm.get("agent_id", ""))
+                        tm_name = tm.get("name", agent_id)
+                        role = tm.get("role", tm.get("description", ""))
+                        if agent_id:
+                            seen_teammates[agent_id] = TeammateInfo(
+                                agent_id=agent_id,
+                                name=tm_name,
+                                role=role,
+                                status="running",
+                            )
+
+                # TaskCreate (shared todo list)
+                elif name == "TaskCreate":
+                    task_id = inp.get("taskId", inp.get("id", str(len(seen_tasks))))
+                    subject = inp.get("subject", inp.get("title", ""))
                     seen_tasks[task_id] = TaskInfo(
                         task_id=task_id,
-                        subject=inp.get("subject", ""),
-                        status=inp.get("status", "unknown"),
+                        subject=subject,
+                        status="pending",
                         owner=inp.get("owner", ""),
+                        description=inp.get("description", ""),
                     )
 
-            elif name in ("SendMessage", "TeamMessage"):
-                # Track which teammates are active
-                target = inp.get("to", inp.get("agentId", ""))
-                if target and target in seen_teammates:
-                    seen_teammates[target].status = "running"
+                # TaskUpdate (shared todo list)
+                elif name == "TaskUpdate":
+                    task_id = inp.get("taskId", inp.get("id", ""))
+                    if task_id in seen_tasks:
+                        if inp.get("status"):
+                            seen_tasks[task_id].status = inp["status"]
+                        if inp.get("owner"):
+                            seen_tasks[task_id].owner = inp["owner"]
+                        if inp.get("subject"):
+                            seen_tasks[task_id].subject = inp["subject"]
+                    else:
+                        seen_tasks[task_id] = TaskInfo(
+                            task_id=task_id,
+                            subject=inp.get("subject", ""),
+                            status=inp.get("status", "unknown"),
+                            owner=inp.get("owner", ""),
+                        )
+
+                elif name in ("SendMessage", "TeamMessage"):
+                    target = inp.get("to", inp.get("agentId", ""))
+                    if target and target in seen_teammates:
+                        seen_teammates[target].status = "running"
+
+            # ── Tool result blocks ───────────────────────────────────
+            elif block_type == "tool_result":
+                tool_use_id = block.get("tool_use_id", "")
+                tool_name = tool_use_id_to_name.get(tool_use_id, "")
+
+                # Task tool result = subagent finished, capture result
+                if tool_name == "Task" or tool_use_id in tool_use_id_to_subagent:
+                    subagent_key = tool_use_id_to_subagent.get(tool_use_id, "")
+                    result_text = ""
+
+                    result_content = block.get("content", "")
+                    if isinstance(result_content, str):
+                        result_text = result_content
+                    elif isinstance(result_content, list):
+                        for sub in result_content:
+                            if isinstance(sub, dict) and sub.get("type") == "text":
+                                result_text += sub.get("text", "")
+
+                    if subagent_key and subagent_key in seen_subagents:
+                        seen_subagents[subagent_key].status = "completed"
+                        seen_subagents[subagent_key].result_summary = result_text[:300]
+
+                    # Check if result contains an agent_id we should track
+                    agent_id_match = re.search(r"agent[_-]?id[:\s]+([a-f0-9-]+)", result_text, re.I)
+                    if agent_id_match and subagent_key and subagent_key in seen_subagents:
+                        real_id = agent_id_match.group(1)
+                        agent = seen_subagents.pop(subagent_key)
+                        agent.agent_id = real_id
+                        seen_subagents[real_id] = agent
+
+    # ── Second pass: scan for task-notification messages ────────────
+    # These are user messages containing XML with actual agent results,
+    # delivered after background agents complete. They carry the real
+    # result text (not just "Async agent launched").
+    for line_idx, msg, byte_size in messages:
+        inner = msg.get("message", {})
+        content = inner.get("content", "")
+
+        # task-notifications are string content in user messages
+        if not isinstance(content, str) or "<task-notification>" not in content:
+            continue
+
+        for match in _TASK_NOTIFICATION_RE.finditer(content):
+            task_id = match.group(1).strip()
+            status = match.group(2).strip()
+            summary = match.group(3).strip()
+            result = match.group(4).strip()
+
+            # Find the matching subagent by agent_id
+            if task_id in seen_subagents:
+                seen_subagents[task_id].status = status
+                seen_subagents[task_id].result_summary = result[:300]
+                if summary and not seen_subagents[task_id].description:
+                    seen_subagents[task_id].description = summary
+            else:
+                # Agent was spawned but we only have the notification
+                seen_subagents[task_id] = SubagentInfo(
+                    agent_id=task_id,
+                    description=summary,
+                    status=status,
+                    result_summary=result[:300],
+                )
+
+            state.message_count += 1
 
     state.teammates = list(seen_teammates.values())
+    state.subagents = list(seen_subagents.values())
     state.tasks = list(seen_tasks.values())
 
     # Build lead summary from last few team-related assistant messages
-    team_msgs = []
+    team_msgs: list[str] = []
     for line_idx, msg, byte_size in messages:
         if msg.get("type") == "assistant" and _is_team_message(msg):
             inner = msg.get("message", {})
             content = inner.get("content", [])
             if isinstance(content, list):
                 for block in content:
-                    if block.get("type") == "text":
+                    if isinstance(block, dict) and block.get("type") == "text":
                         team_msgs.append(block.get("text", "")[:300])
 
     if team_msgs:
-        # Keep last 3 coordination messages as context
         state.lead_summary = " [...] ".join(team_msgs[-3:])
 
     return state
