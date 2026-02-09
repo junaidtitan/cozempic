@@ -1,12 +1,12 @@
 # Cozempic
 
-Context weight-loss tool for [Claude Code](https://claude.ai/code). Prune bloated JSONL sessions and **prevent Agent Teams from being lost when auto-compaction fires**.
+Context cleaning for [Claude Code](https://claude.ai/code) — **remove the bloat, keep everything that matters**.
 
 Claude Code sessions grow large — 8-46MB from progress ticks, repeated thinking blocks, stale file reads, duplicate document injections, and metadata bloat. When sessions get too big, Claude's auto-compaction kicks in and summarizes away critical context. For users running **Agent Teams**, this is catastrophic: the lead agent's context is compacted, team state (teammates, tasks, coordination messages) is discarded, and the entire team is orphaned with no way to recover.
 
-Cozempic solves both problems:
-- **Session pruning** — composable strategies that remove dead weight before compaction ever triggers
-- **Guard mode** — a background daemon that monitors session size and automatically prunes with team-state preservation, so Agent Teams survive across context resets
+Cozempic cleans your context intelligently:
+- **Targeted strategies** — remove dead weight (progress ticks, stale reads, duplicate content) while preserving everything valuable: your conversation, decisions, tool results, and team coordination
+- **Guard mode** — a background daemon that keeps sessions lean automatically, so auto-compaction never fires and Agent Teams survive across context resets
 
 **Zero external dependencies.** Python 3.10+ stdlib only.
 
@@ -42,7 +42,7 @@ cozempic treat current --execute
 # Go aggressive on a specific session
 cozempic treat <session_id> -rx aggressive --execute
 
-# Protect Agent Teams from context loss (run in a separate terminal)
+# Keep context clean automatically — protect Agent Teams (run in a separate terminal)
 cozempic guard --threshold 50 -rx standard
 ```
 
@@ -50,7 +50,7 @@ Session IDs accept full UUIDs, UUID prefixes, file paths, or `current` for auto-
 
 ## How It Works
 
-Cozempic uses **strategies** — pure functions that analyze messages and produce declarative prune actions (remove or replace). Strategies are grouped into **prescriptions**:
+Cozempic uses **strategies** — targeted functions that identify what's bloat and what's valuable. Each strategy produces declarative actions (remove or replace) that clean dead weight while leaving your meaningful context untouched. Strategies are grouped into **prescriptions**:
 
 | Prescription | Strategies | Risk | Typical Savings |
 |---|---|---|---|
@@ -95,7 +95,7 @@ cozempic treat <session> [-rx PRESET]   Run prescription (dry-run default)
 cozempic treat <session> --execute      Apply changes with backup
 cozempic strategy <name> <session>      Run single strategy
 cozempic reload [-rx PRESET]            Treat + auto-resume in new terminal
-cozempic guard [--threshold MB]         Prevent Agent Teams context loss from auto-compaction
+cozempic guard [--threshold MB]         Auto-clean context, prevent Agent Teams loss
 cozempic doctor [--fix]                 Check for known Claude Code issues
 cozempic formulary                      Show all strategies & prescriptions
 ```
@@ -106,7 +106,7 @@ Use `current` as the session argument in any command to auto-detect the active s
 
 > **The problem:** Agent Teams are lost after auto-compaction. When a session grows too large, Claude's auto-compaction summarizes the lead agent's context — discarding TeamCreate, SendMessage, TaskCreate/Update messages. The lead forgets its teammates exist. Subagents become orphaned. There is no built-in recovery. ([#23620](https://github.com/anthropics/claude-code/issues/23620), [#23821](https://github.com/anthropics/claude-code/issues/23821), [#24052](https://github.com/anthropics/claude-code/issues/24052), [#21925](https://github.com/anthropics/claude-code/issues/21925))
 
-Guard is a background daemon that **prevents auto-compaction from ever triggering** by keeping sessions lean, while preserving every team coordination message.
+Guard is a background daemon that **prevents auto-compaction from ever triggering** by continuously cleaning dead weight — while preserving every conversation, decision, and team coordination message that matters.
 
 ```bash
 # Protect Agent Teams — run this in a separate terminal
@@ -128,11 +128,11 @@ cozempic guard --threshold 30 --interval 15
 5. **Injects team state as a synthetic message pair** directly into the JSONL — when Claude resumes, it *sees* the team as conversation history (force-read, not a suggestion)
 6. Triggers auto-reload (kill + resume in new terminal) so Claude picks up the pruned context
 
-**The result:** Auto-compaction never fires because the session stays under threshold. Agent Teams survive with full coordination state intact — teammates, tasks, roles, and messages are all preserved across context resets. No more orphaned subagents.
+**The result:** Your context stays clean and under threshold — auto-compaction never fires. Everything valuable is preserved: your conversation history, decisions, tool results, and full Agent Teams coordination state. No more orphaned subagents, no more lost context.
 
 ## Doctor
 
-Beyond session pruning, Cozempic can check for known Claude Code configuration issues:
+Beyond context cleaning, Cozempic can check for known Claude Code configuration issues:
 
 ```bash
 cozempic doctor        # Diagnose issues

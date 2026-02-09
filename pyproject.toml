@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "cozempic"
 version = "0.3.0"
-description = "Context weight-loss tool for Claude Code — prune bloated sessions and prevent Agent Teams context loss"
+description = "Context cleaning for Claude Code — remove the bloat, keep everything that matters"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
