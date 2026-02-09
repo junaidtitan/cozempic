@@ -13,6 +13,7 @@ from .diagnosis import diagnose_session
 from .doctor import run_doctor
 from .executor import execute_actions, run_prescription
 from .guard import checkpoint_team, start_guard
+from .init import run_init
 from .recap import save_recap
 from .registry import PRESCRIPTIONS, STRATEGIES
 from .session import find_current_session, find_sessions, load_messages, resolve_session, save_messages
@@ -471,6 +472,55 @@ def cmd_doctor(args):
     print()
 
 
+def cmd_init(args):
+    """Wire cozempic hooks and slash command into the current project."""
+    project_dir = args.cwd or os.getcwd()
+
+    print(f"\n  COZEMPIC INIT")
+    print(f"  ═══════════════════════════════════════════════════════════════════")
+    print(f"  Project: {project_dir}")
+    print()
+
+    result = run_init(project_dir, skip_slash=args.no_slash_command)
+
+    # Report hooks
+    hooks = result["hooks"]
+    if hooks["added"]:
+        print(f"  Hooks added to {hooks['settings_path']}:")
+        for h in hooks["added"]:
+            print(f"    + {h}")
+        if hooks["backup_path"]:
+            print(f"  Backup: {hooks['backup_path']}")
+    else:
+        print(f"  Hooks: already configured (nothing to add)")
+
+    if hooks["skipped"]:
+        for h in hooks["skipped"]:
+            print(f"    ~ {h} (already exists, skipped)")
+
+    print()
+
+    # Report slash command
+    slash = result["slash_command"]
+    if slash["installed"]:
+        print(f"  Slash command: installed → {slash['path']}")
+        print(f"  Use /cozempic in any Claude Code session to diagnose and treat.")
+    elif slash["already_existed"]:
+        print(f"  Slash command: already installed at {slash['path']}")
+    elif not args.no_slash_command:
+        print(f"  Slash command: source not found (install from git repo to get it)")
+
+    print()
+
+    # Summary: what to do next
+    print(f"  Setup complete. Next steps:")
+    print(f"    1. Start a Claude Code session in this project")
+    print(f"    2. In a second terminal, run: cozempic guard")
+    print(f"    3. That's it — hooks checkpoint on every agent event,")
+    print(f"       guard continuously monitors and prunes when needed.")
+    print()
+
+
 def cmd_formulary(args):
     print("\n  COZEMPIC FORMULARY")
     print("  ═══════════════════════════════════════════════════════════════════")
@@ -559,6 +609,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_guard.add_argument("--interval", type=int, default=30, help="Check interval in seconds (default: 30)")
     p_guard.add_argument("--no-reload", action="store_true", help="Prune without auto-reload at hard threshold")
 
+    # init
+    p_init = sub.add_parser("init", help="Auto-wire hooks and slash command into this project")
+    p_init.add_argument("--cwd", help="Project directory (default: current)")
+    p_init.add_argument("--no-slash-command", action="store_true", help="Skip installing /cozempic slash command")
+
     # doctor
     p_doctor = sub.add_parser("doctor", help="Check for known Claude Code issues and fix them")
     p_doctor.add_argument("--fix", action="store_true", help="Auto-fix issues where possible")
@@ -586,6 +641,7 @@ def main():
         "reload": cmd_reload,
         "checkpoint": cmd_checkpoint,
         "guard": cmd_guard,
+        "init": cmd_init,
         "doctor": cmd_doctor,
         "formulary": cmd_formulary,
     }

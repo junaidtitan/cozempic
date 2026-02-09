@@ -33,9 +33,33 @@ cd cozempic
 pip install -e .
 ```
 
+## Setup
+
+After installing, run `init` from your project directory to auto-wire hooks and the slash command:
+
+```bash
+cd your-project/
+cozempic init
+```
+
+This does two things:
+1. **Wires checkpoint hooks** into `.claude/settings.json` — captures team state after every agent spawn, task change, before compaction, and at session end
+2. **Installs `/cozempic` slash command** to `~/.claude/commands/` — diagnose and treat from within any session
+
+Idempotent — safe to run multiple times. Existing hooks and settings are preserved.
+
+For full Agent Teams protection, also run the guard daemon in a second terminal:
+
+```bash
+cozempic guard
+```
+
 ## Quick Start
 
 ```bash
+# One-time setup: wire hooks + slash command
+cozempic init
+
 # List all sessions with sizes
 cozempic list
 
@@ -103,6 +127,7 @@ cozempic strategy thinking-blocks <session_id> --thinking-mode truncate
 ## Commands
 
 ```
+cozempic init                               Wire hooks + slash command into project
 cozempic list [--project NAME]              List sessions with sizes
 cozempic current [-d]                       Show/diagnose current session (auto-detect)
 cozempic diagnose <session>                 Analyze bloat sources (read-only)
