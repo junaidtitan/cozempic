@@ -35,24 +35,20 @@ pip install -e .
 
 ## Setup
 
-After installing, run `init` from your project directory to auto-wire hooks and the slash command:
+After installing, run `init` from your project directory:
 
 ```bash
 cd your-project/
 cozempic init
 ```
 
-This does two things:
-1. **Wires checkpoint hooks** into `.claude/settings.json` — captures team state after every agent spawn, task change, before compaction, and at session end
-2. **Installs `/cozempic` slash command** to `~/.claude/commands/` — diagnose and treat from within any session
+That's it. This auto-wires everything:
 
-Idempotent — safe to run multiple times. Existing hooks and settings are preserved.
+1. **Guard daemon auto-start** — `SessionStart` hook spawns `cozempic guard --daemon` when Claude Code opens. Background process, PID file prevents double-starts, logs to `/tmp/cozempic_guard_*.log`
+2. **Checkpoint hooks** — `PostToolUse[Task|TaskCreate|TaskUpdate]`, `PreCompact`, `Stop` capture team state at every critical moment
+3. **`/cozempic` slash command** — installed to `~/.claude/commands/` for in-session diagnosis and treatment
 
-For full Agent Teams protection, also run the guard daemon in a second terminal:
-
-```bash
-cozempic guard
-```
+Idempotent — safe to run multiple times. Existing hooks and settings are preserved. No second terminal needed.
 
 ## Quick Start
 
@@ -78,8 +74,12 @@ cozempic treat <session_id> -rx aggressive --execute
 # Save team/agent state right now (no pruning, instant)
 cozempic checkpoint --show
 
-# Keep context clean automatically — run in a separate terminal
+# Guard auto-starts on session open (after cozempic init)
+# Or run manually with custom thresholds:
 cozempic guard --threshold 50 -rx standard
+
+# Run as background daemon (what the SessionStart hook uses):
+cozempic guard --daemon
 
 # Treat + auto-resume in a new terminal
 cozempic reload -rx gentle

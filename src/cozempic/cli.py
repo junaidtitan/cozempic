@@ -12,7 +12,7 @@ from pathlib import Path
 from .diagnosis import diagnose_session
 from .doctor import run_doctor
 from .executor import execute_actions, run_prescription
-from .guard import checkpoint_team, start_guard
+from .guard import checkpoint_team, start_guard, start_guard_daemon
 from .init import run_init
 from .recap import save_recap
 from .registry import PRESCRIPTIONS, STRATEGIES
@@ -410,6 +410,22 @@ def cmd_checkpoint(args):
 
 def cmd_guard(args):
     """Start the guard daemon to prevent compaction-induced state loss."""
+    if args.daemon:
+        result = start_guard_daemon(
+            cwd=args.cwd or os.getcwd(),
+            threshold_mb=args.threshold,
+            soft_threshold_mb=args.soft_threshold,
+            rx_name=args.rx or "standard",
+            interval=args.interval,
+            auto_reload=not args.no_reload,
+        )
+        if result["already_running"]:
+            print(f"  Guard already running (PID {result['pid']})")
+        elif result["started"]:
+            print(f"  Guard daemon started (PID {result['pid']})")
+            print(f"  Log: {result['log_file']}")
+        return
+
     start_guard(
         cwd=args.cwd or os.getcwd(),
         threshold_mb=args.threshold,
@@ -513,11 +529,13 @@ def cmd_init(args):
     print()
 
     # Summary: what to do next
-    print(f"  Setup complete. Next steps:")
-    print(f"    1. Start a Claude Code session in this project")
-    print(f"    2. In a second terminal, run: cozempic guard")
-    print(f"    3. That's it — hooks checkpoint on every agent event,")
-    print(f"       guard continuously monitors and prunes when needed.")
+    print(f"  Setup complete. Protection is fully automatic:")
+    print(f"    - Guard daemon auto-starts on every session (SessionStart hook)")
+    print(f"    - Team state checkpointed on every agent event (PostToolUse hooks)")
+    print(f"    - Emergency checkpoint before compaction (PreCompact hook)")
+    print(f"    - Final checkpoint on session end (Stop hook)")
+    print()
+    print(f"  Just start Claude Code normally. No second terminal needed.")
     print()
 
 
@@ -608,6 +626,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_guard.add_argument("--soft-threshold", type=float, default=None, help="Soft threshold in MB — gentle prune, no reload (default: 60%% of --threshold)")
     p_guard.add_argument("--interval", type=int, default=30, help="Check interval in seconds (default: 30)")
     p_guard.add_argument("--no-reload", action="store_true", help="Prune without auto-reload at hard threshold")
+    p_guard.add_argument("--daemon", action="store_true", help="Run in background (PID file prevents double-starts)")
 
     # init
     p_init = sub.add_parser("init", help="Auto-wire hooks and slash command into this project")

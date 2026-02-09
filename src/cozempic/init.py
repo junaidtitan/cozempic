@@ -19,6 +19,17 @@ from pathlib import Path
 # ─── Hook definitions ────────────────────────────────────────────────────────
 
 COZEMPIC_HOOKS = {
+    "SessionStart": [
+        {
+            "matcher": "",
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": "cozempic guard --daemon 2>/dev/null || true",
+                }
+            ],
+        },
+    ],
     "PostToolUse": [
         {
             "matcher": "Task",

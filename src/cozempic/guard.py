@@ -419,6 +419,109 @@ def _spawn_reload_watcher(claude_pid: int, project_dir: str):
     )
 
 
+def _pid_file(cwd: str) -> Path:
+    """Return the PID file path for a guard daemon in this project."""
+    # Use a hash of the cwd so each project gets its own PID file
+    import hashlib
+    slug = hashlib.md5(cwd.encode()).hexdigest()[:12]
+    return Path("/tmp") / f"cozempic_guard_{slug}.pid"
+
+
+def _is_guard_running(cwd: str) -> int | None:
+    """Check if a guard daemon is already running for this project.
+
+    Returns the PID if running, None otherwise.
+    """
+    pid_path = _pid_file(cwd)
+    if not pid_path.exists():
+        return None
+
+    try:
+        pid = int(pid_path.read_text().strip())
+        # Check if process is actually alive
+        os.kill(pid, 0)
+        return pid
+    except (ValueError, ProcessLookupError, PermissionError):
+        # Stale PID file — clean it up
+        pid_path.unlink(missing_ok=True)
+        return None
+
+
+def start_guard_daemon(
+    cwd: str | None = None,
+    threshold_mb: float = 50.0,
+    soft_threshold_mb: float | None = None,
+    rx_name: str = "standard",
+    interval: int = 30,
+    auto_reload: bool = True,
+) -> dict:
+    """Start the guard as a background daemon.
+
+    Spawns a detached subprocess running `cozempic guard` with output
+    redirected to a log file. Uses a PID file to prevent double-starts.
+
+    Returns dict with: started (bool), pid (int|None), pid_file, log_file,
+    already_running (bool).
+    """
+    cwd = cwd or os.getcwd()
+
+    existing_pid = _is_guard_running(cwd)
+    if existing_pid:
+        return {
+            "started": False,
+            "pid": existing_pid,
+            "pid_file": str(_pid_file(cwd)),
+            "log_file": None,
+            "already_running": True,
+        }
+
+    import hashlib
+    slug = hashlib.md5(cwd.encode()).hexdigest()[:12]
+    log_file = Path("/tmp") / f"cozempic_guard_{slug}.log"
+    pid_path = _pid_file(cwd)
+
+    # Build the guard command
+    cmd_parts = [
+        sys.executable, "-m", "cozempic.cli", "guard",
+        "--cwd", cwd,
+        "--threshold", str(threshold_mb),
+        "--interval", str(interval),
+        "-rx", rx_name,
+    ]
+    if soft_threshold_mb is not None:
+        cmd_parts.extend(["--soft-threshold", str(soft_threshold_mb)])
+    if not auto_reload:
+        cmd_parts.append("--no-reload")
+
+    # Spawn detached process
+    with open(log_file, "a") as lf:
+        from datetime import datetime
+        lf.write(f"\n--- Guard daemon started at {datetime.now().isoformat()} ---\n")
+        lf.write(f"CWD: {cwd}\n")
+        lf.write(f"CMD: {' '.join(cmd_parts)}\n\n")
+        lf.flush()
+
+        proc = subprocess.Popen(
+            cmd_parts,
+            stdout=lf,
+            stderr=lf,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            cwd=cwd,
+        )
+
+    # Write PID file
+    pid_path.write_text(str(proc.pid))
+
+    return {
+        "started": True,
+        "pid": proc.pid,
+        "pid_file": str(pid_path),
+        "log_file": str(log_file),
+        "already_running": False,
+    }
+
+
 def _now() -> str:
     from datetime import datetime
     return datetime.now().strftime("%H:%M:%S")
