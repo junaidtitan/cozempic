@@ -175,19 +175,12 @@ def install_slash_command(project_dir: str) -> dict:
 
     Returns dict with: installed (bool), path, already_existed (bool).
     """
-    # Find the slash command source — it's bundled with the package
-    source = Path(__file__).parent.parent.parent / ".claude" / "commands" / "cozempic.md"
+    # Find the slash command source — bundled as package data
+    source = Path(__file__).parent / "data" / "cozempic_slash_command.md"
 
-    # Fallback: check relative to the installed package
+    # Fallback: dev/editable install — check repo root
     if not source.exists():
-        # Try package data location
-        import importlib.resources
-        try:
-            ref = importlib.resources.files("cozempic") / "commands" / "cozempic.md"
-            if ref.is_file():
-                source = Path(str(ref))
-        except (AttributeError, FileNotFoundError):
-            pass
+        source = Path(__file__).parent.parent.parent / ".claude" / "commands" / "cozempic.md"
 
     target_dir = Path.home() / ".claude" / "commands"
     target = target_dir / "cozempic.md"
