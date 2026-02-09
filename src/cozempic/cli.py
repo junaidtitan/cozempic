@@ -412,6 +412,7 @@ def cmd_guard(args):
     start_guard(
         cwd=args.cwd or os.getcwd(),
         threshold_mb=args.threshold,
+        soft_threshold_mb=args.soft_threshold,
         rx_name=args.rx or "standard",
         interval=args.interval,
         auto_reload=not args.no_reload,
@@ -553,9 +554,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_guard = sub.add_parser("guard", help="Background sentinel — auto-prune before compaction triggers")
     p_guard.add_argument("--cwd", help="Working directory (default: current)")
     p_guard.add_argument("-rx", help="Prescription to apply (default: standard)")
-    p_guard.add_argument("--threshold", type=float, default=50.0, help="File size threshold in MB (default: 50)")
+    p_guard.add_argument("--threshold", type=float, default=50.0, help="Hard threshold in MB — full prune + reload (default: 50)")
+    p_guard.add_argument("--soft-threshold", type=float, default=None, help="Soft threshold in MB — gentle prune, no reload (default: 60%% of --threshold)")
     p_guard.add_argument("--interval", type=int, default=30, help="Check interval in seconds (default: 30)")
-    p_guard.add_argument("--no-reload", action="store_true", help="Prune without auto-reload (just trim the file)")
+    p_guard.add_argument("--no-reload", action="store_true", help="Prune without auto-reload at hard threshold")
 
     # doctor
     p_doctor = sub.add_parser("doctor", help="Check for known Claude Code issues and fix them")

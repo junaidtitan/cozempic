@@ -10,11 +10,12 @@ Claude Code context fills up with dead weight that wastes your token budget: hun
 
 When context gets too large, Claude's auto-compaction summarizes away critical state. For **Agent Teams**, this is catastrophic: the lead agent's context is compacted, team coordination messages (TeamCreate, SendMessage, TaskCreate/Update) are discarded, the lead forgets its teammates exist, and subagents are orphaned with no recovery path. ([#23620](https://github.com/anthropics/claude-code/issues/23620), [#23821](https://github.com/anthropics/claude-code/issues/23821), [#24052](https://github.com/anthropics/claude-code/issues/24052), [#21925](https://github.com/anthropics/claude-code/issues/21925))
 
-Cozempic prevents this with three layers of protection:
+Cozempic prevents this with four layers of protection:
 
 1. **Continuous checkpoint** — saves team state to disk every N seconds so it's always recoverable
 2. **Hook-driven checkpoint** — fires after every Task spawn, TaskCreate/Update, before compaction, and at session end
-3. **Emergency prune** — at a configurable size threshold, prunes dead weight with team-protect, injects recovery messages, and optionally reloads Claude
+3. **Tiered pruning** — soft threshold gently trims bloat without disruption; hard threshold does full prune + optional reload
+4. **Config.json ground truth** — reads `~/.claude/teams/*/config.json` for authoritative team state (lead, members, models, cwds)
 
 **Zero external dependencies.** Python 3.10+ stdlib only.
 
@@ -102,17 +103,18 @@ cozempic strategy thinking-blocks <session_id> --thinking-mode truncate
 ## Commands
 
 ```
-cozempic list [--project NAME]          List sessions with sizes
-cozempic current [-d]                   Show/diagnose current session (auto-detect)
-cozempic diagnose <session>             Analyze bloat sources (read-only)
-cozempic treat <session> [-rx PRESET]   Run prescription (dry-run default)
-cozempic treat <session> --execute      Apply changes with backup
-cozempic strategy <name> <session>      Run single strategy
-cozempic reload [-rx PRESET]            Treat + auto-resume in new terminal
-cozempic checkpoint [--show]            Save team/agent state to disk (no pruning)
-cozempic guard [--threshold MB]         Continuous checkpoint + emergency prune (background)
-cozempic doctor [--fix]                 Check for known Claude Code issues
-cozempic formulary                      Show all strategies & prescriptions
+cozempic list [--project NAME]              List sessions with sizes
+cozempic current [-d]                       Show/diagnose current session (auto-detect)
+cozempic diagnose <session>                 Analyze bloat sources (read-only)
+cozempic treat <session> [-rx PRESET]       Run prescription (dry-run default)
+cozempic treat <session> --execute          Apply changes with backup
+cozempic strategy <name> <session>          Run single strategy
+cozempic reload [-rx PRESET]                Treat + auto-resume in new terminal
+cozempic checkpoint [--show]                Save team/agent state to disk (no pruning)
+cozempic guard [--threshold MB]             Tiered guard: checkpoint + soft/hard prune
+cozempic guard --soft-threshold 25          Custom soft threshold (default: 60% of hard)
+cozempic doctor [--fix]                     Check for known Claude Code issues
+cozempic formulary                          Show all strategies & prescriptions
 ```
 
 Use `current` as the session argument in any command to auto-detect the active session for your working directory.
@@ -151,7 +153,9 @@ Shared task list:
 
 ### What gets detected
 
-Cozempic scans the JSONL session file for all team coordination patterns:
+Cozempic scans two data sources and merges them:
+
+**JSONL session file** (runtime state):
 
 | Pattern | Source | What's Extracted |
 |---------|--------|-----------------|
@@ -161,37 +165,59 @@ Cozempic scans the JSONL session file for all team coordination patterns:
 | `TaskOutput` / `TaskStop` | Background agent management | agent status updates |
 | `TeamCreate` / `SendMessage` | Explicit team coordination | team name, teammate roles |
 
+**`~/.claude/teams/*/config.json`** (ground truth):
+
+| Field | What's Extracted |
+|-------|-----------------|
+| `name` | Authoritative team name |
+| `leadAgentId` | Lead agent identifier |
+| `leadSessionId` | Lead agent's session UUID |
+| `members[].model` | Model used by each teammate (e.g., `claude-opus-4-6`) |
+| `members[].cwd` | Working directory for each teammate |
+| `members[].agentType` | Role/type of each teammate |
+
+Config.json fields are authoritative — they override JSONL-inferred values. JSONL is authoritative for runtime state (subagent progress, task status, results).
+
 The checkpoint is written to `.claude/projects/<project>/team-checkpoint.md`.
 
 ## Guard — Continuous Protection
 
-Guard is a background daemon with two phases:
+Guard is a background daemon with three phases:
 
-**Phase 1: Continuous checkpoint** (every interval) — extracts team state and writes to disk. Lightweight read-only scan. Team state is always recoverable even if Claude crashes.
+**Phase 1: Continuous checkpoint** (every interval) — extracts team state and writes to disk. Lightweight read-only scan. Team state is always recoverable even if Claude crashes. Also merges `~/.claude/teams/*/config.json` as ground truth for team name, lead agent, member models, and working directories.
 
-**Phase 2: Emergency prune** (at threshold) — when file size crosses the threshold, prunes dead weight with team-protect, injects recovery messages into the JSONL, and optionally kills + resumes Claude.
+**Phase 2: Soft prune** (at soft threshold) — when file size crosses the soft threshold, applies a `gentle` prescription to trim easy bloat (progress ticks, metadata, stale reads). **No reload** — the session continues uninterrupted.
+
+**Phase 3: Hard prune** (at hard threshold) — when file size crosses the hard threshold, applies the full prescription with team-protect, injects recovery messages, and optionally kills + resumes Claude.
+
+The soft threshold defaults to 60% of the hard threshold. This gives a two-phase degradation: trim early and often, escalate only when needed.
 
 ```bash
 # Standard — run in a separate terminal
 cozempic guard
 
-# Custom threshold and interval
-cozempic guard --threshold 30 --interval 15 -rx standard
+# Custom thresholds and interval
+cozempic guard --threshold 40 --soft-threshold 25 --interval 15 -rx standard
 
 # Without auto-reload (just clean, no restart)
 cozempic guard --threshold 50 --no-reload
+
+# Aggressive at hard threshold, gentle at soft (automatic)
+cozempic guard --threshold 30 -rx aggressive
 ```
 
 Output:
 
 ```
-  COZEMPIC GUARD v2
+  COZEMPIC GUARD v3
   ===================================================================
   Session:     abc123.jsonl
   Size:        5.4MB
-  Threshold:   50.0MB (emergency prune)
-  Rx:          standard
+  Soft:        30.0MB (gentle prune, no reload)
+  Hard:        50.0MB (full prune + reload)
+  Rx:          gentle (soft) / standard (hard)
   Interval:    30s
+  Team-protect: enabled
   Checkpoint:  continuous (every 30s)
 
   Guarding... (Ctrl+C to stop)
@@ -199,20 +225,27 @@ Output:
   [14:23:01] Checkpoint #1: 6 agents, 9 tasks, 121 msgs (5.4MB)
   [14:25:31] Checkpoint #2: 8 agents, 12 tasks, 156 msgs (6.1MB)
   [14:28:01] Checkpoint #3: 8 agents, 12 tasks, 189 msgs (7.2MB)
+  [14:45:01] SOFT THRESHOLD: 30.2MB >= 30.0MB
+             Gentle prune, no reload (cycle #1)
+             Trimmed: 4.1MB saved
+  [15:10:01] HARD THRESHOLD: 50.3MB >= 50.0MB
+             Emergency prune with standard (cycle #1)
+             Pruned: 12.4MB saved
+             Team 'dev-agents' state preserved (87 messages)
 ```
 
 On Ctrl+C, guard writes a final checkpoint before exiting.
 
 ### How team-protect works
 
-During emergency prune:
+During prune (soft or hard):
 
-1. **Extract** full team state (subagents, tasks, teammates, coordination history)
+1. **Extract** full team state from JSONL + `~/.claude/teams/*/config.json`
 2. **Separate** team messages from non-team messages
 3. **Prune** only non-team messages using the prescription
 4. **Merge** team messages back at their original positions
 5. **Inject** a synthetic message pair confirming team state (Claude *sees* this as conversation history)
-6. **Save** with backup, then optionally reload
+6. **Save** with backup, then optionally reload (hard only)
 
 ## Hook Integration
 
@@ -283,7 +316,9 @@ This checkpoints team state:
 | Layer | Trigger | What it does |
 |-------|---------|-------------|
 | **Hooks** | Every Task/TaskCreate/TaskUpdate, PreCompact, Stop | Instant checkpoint to disk |
-| **Guard** | Every N seconds | Continuous checkpoint + emergency prune at threshold |
+| **Guard (checkpoint)** | Every N seconds | Extract team state + config.json, write checkpoint |
+| **Guard (soft prune)** | At soft threshold (default 60% of hard) | Gentle prune, no reload, no disruption |
+| **Guard (hard prune)** | At hard threshold | Full prune + team-protect + optional reload |
 | **Reload** | Manual (`cozempic reload`) | One-shot prune + auto-resume |
 | **Checkpoint** | Manual (`cozempic checkpoint`) | One-shot state save |
 

@@ -139,29 +139,40 @@ def prune_with_team_protect(
 def start_guard(
     cwd: str | None = None,
     threshold_mb: float = 50.0,
+    soft_threshold_mb: float | None = None,
     rx_name: str = "standard",
     interval: int = 30,
     auto_reload: bool = True,
     config: dict | None = None,
 ) -> None:
-    """Start the guard daemon.
+    """Start the guard daemon with tiered pruning.
 
-    Two-phase protection:
+    Three-phase protection:
       1. CHECKPOINT every interval — extract team state, write to disk
-      2. PRUNE at threshold — emergency prune with team-protect
+      2. SOFT PRUNE at soft threshold — gentle prune, no reload, no disruption
+      3. HARD PRUNE at hard threshold — full prune with team-protect + optional reload
 
-    The checkpoint is lightweight (read-only scan + write checkpoint file).
-    Pruning only happens when the file size crosses the threshold.
+    The soft threshold acts as a first line of defense: it trims easy bloat
+    (progress ticks, metadata, stale reads) without disrupting the session.
+    The hard threshold is the emergency fallback when soft pruning isn't enough.
+
+    Default soft threshold is 60% of hard threshold if not specified.
 
     Args:
         cwd: Working directory for session detection.
-        threshold_mb: File size threshold in MB before pruning triggers.
-        rx_name: Prescription to apply (gentle, standard, aggressive).
+        threshold_mb: Hard threshold in MB — emergency prune + optional reload.
+        soft_threshold_mb: Soft threshold in MB — gentle prune, no reload.
+            Defaults to 60% of threshold_mb.
+        rx_name: Prescription to apply at hard threshold.
         interval: Check interval in seconds.
-        auto_reload: If True, kill Claude and auto-resume after pruning.
+        auto_reload: If True, kill Claude and auto-resume after hard prune.
         config: Extra config for pruning strategies.
     """
-    threshold_bytes = int(threshold_mb * 1024 * 1024)
+    hard_threshold_bytes = int(threshold_mb * 1024 * 1024)
+
+    if soft_threshold_mb is None:
+        soft_threshold_mb = round(threshold_mb * 0.6, 1)
+    soft_threshold_bytes = int(soft_threshold_mb * 1024 * 1024)
 
     # Find the initial session first
     sess = find_current_session(cwd)
@@ -172,20 +183,21 @@ def start_guard(
 
     session_path = sess["path"]
 
-    print(f"\n  COZEMPIC GUARD v2")
+    print(f"\n  COZEMPIC GUARD v3")
     print(f"  ═══════════════════════════════════════════════════════════════════")
     print(f"  Session:     {session_path.name}")
     print(f"  Size:        {sess['size'] / 1024 / 1024:.1f}MB")
-    print(f"  Threshold:   {threshold_mb}MB (emergency prune)")
-    print(f"  Rx:          {rx_name}")
+    print(f"  Soft:        {soft_threshold_mb}MB (gentle prune, no reload)")
+    print(f"  Hard:        {threshold_mb}MB (full prune + {'reload' if auto_reload else 'no reload'})")
+    print(f"  Rx:          gentle (soft) / {rx_name} (hard)")
     print(f"  Interval:    {interval}s")
-    print(f"  Reload:      {'yes' if auto_reload else 'no'}")
     print(f"  Team-protect: enabled")
     print(f"  Checkpoint:  continuous (every {interval}s)")
     print(f"\n  Guarding... (Ctrl+C to stop)")
     print()
 
     prune_count = 0
+    soft_prune_count = 0
     checkpoint_count = 0
     last_team_hash = ""
 
@@ -222,12 +234,12 @@ def start_guard(
                         f"({size_mb:.1f}MB)"
                     )
 
-            # ── Phase 2: Emergency prune at threshold ─────────────────
-            if current_size >= threshold_bytes:
+            # ── Phase 3: HARD prune at hard threshold ─────────────────
+            if current_size >= hard_threshold_bytes:
                 prune_count += 1
                 size_mb = current_size / 1024 / 1024
-                print(f"  [{_now()}] THRESHOLD CROSSED: {size_mb:.1f}MB > {threshold_mb}MB")
-                print(f"  Emergency prune (cycle #{prune_count})...")
+                print(f"  [{_now()}] HARD THRESHOLD: {size_mb:.1f}MB >= {threshold_mb}MB")
+                print(f"  Emergency prune with {rx_name} (cycle #{prune_count})...")
 
                 result = guard_prune_cycle(
                     session_path=session_path,
@@ -249,11 +261,38 @@ def start_guard(
                     )
                 print()
 
+            # ── Phase 2: SOFT prune at soft threshold ─────────────────
+            elif current_size >= soft_threshold_bytes:
+                soft_prune_count += 1
+                size_mb = current_size / 1024 / 1024
+                print(f"  [{_now()}] SOFT THRESHOLD: {size_mb:.1f}MB >= {soft_threshold_mb}MB")
+                print(f"  Gentle prune, no reload (cycle #{soft_prune_count})...")
+
+                result = guard_prune_cycle(
+                    session_path=session_path,
+                    rx_name="gentle",
+                    config=config,
+                    auto_reload=False,  # Never reload on soft prune
+                    cwd=cwd or os.getcwd(),
+                )
+
+                print(f"  Trimmed: {result['saved_mb']:.1f}MB saved")
+                if result.get("team_name"):
+                    print(
+                        f"  Team '{result['team_name']}' state preserved "
+                        f"({result['team_messages']} messages)"
+                    )
+                print()
+
     except KeyboardInterrupt:
         # Final checkpoint before exit
         print(f"\n  [{_now()}] Final checkpoint before exit...")
         checkpoint_team(session_path=session_path, quiet=False)
-        print(f"  Guard stopped. {checkpoint_count} checkpoints, {prune_count} prunes.")
+        total_prunes = prune_count + soft_prune_count
+        print(
+            f"  Guard stopped. {checkpoint_count} checkpoints, "
+            f"{soft_prune_count} soft prunes, {prune_count} hard prunes."
+        )
 
 
 def guard_prune_cycle(

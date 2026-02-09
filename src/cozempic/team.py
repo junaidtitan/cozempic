@@ -36,12 +36,14 @@ class SubagentInfo:
 
 @dataclass
 class TeammateInfo:
-    """Information about a named teammate (explicit team)."""
+    """Information about a named teammate (explicit team or config.json)."""
 
     agent_id: str
     name: str
     role: str = ""
     status: str = "unknown"  # running, done, idle
+    model: str = ""
+    cwd: str = ""
 
 
 @dataclass
@@ -60,6 +62,9 @@ class TeamState:
     """Extracted state of an agent team from conversation history."""
 
     team_name: str = ""
+    lead_agent_id: str = ""
+    lead_session_id: str = ""
+    config_source: str = ""  # "config.json", "jsonl", or "both"
     teammates: list[TeammateInfo] = field(default_factory=list)
     subagents: list[SubagentInfo] = field(default_factory=list)
     tasks: list[TaskInfo] = field(default_factory=list)
@@ -80,14 +85,24 @@ class TeamState:
         lines = []
         lines.append(f"# Agent Team Checkpoint: {self.team_name or 'unnamed'}")
         lines.append(f"_Generated: {datetime.now().isoformat()}_")
+        if self.config_source:
+            lines.append(f"_Source: {self.config_source}_")
         lines.append("")
+
+        if self.lead_agent_id or self.lead_session_id:
+            lines.append(f"**Lead:** `{self.lead_agent_id}` (session: `{self.lead_session_id[:12]}...`)")
+            lines.append("")
 
         if self.teammates:
             lines.append("## Teammates")
             for t in self.teammates:
                 status = f" ({t.status})" if t.status != "unknown" else ""
                 role = f" — {t.role}" if t.role else ""
-                lines.append(f"- **{t.name}** (`{t.agent_id}`){role}{status}")
+                model = f" [{t.model}]" if t.model else ""
+                cwd = f" cwd: {t.cwd}" if t.cwd else ""
+                lines.append(f"- **{t.name}** (`{t.agent_id}`){role}{model}{status}")
+                if cwd:
+                    lines.append(f"  {cwd}")
             lines.append("")
 
         if self.subagents:
@@ -124,12 +139,15 @@ class TeamState:
         """Render team state as text for injection into conversation."""
         parts = []
         parts.append(f"Active agent team: {self.team_name or 'unnamed'}")
+        if self.lead_agent_id:
+            parts.append(f"Lead: {self.lead_agent_id} (session: {self.lead_session_id})")
 
         if self.teammates:
             parts.append("\nTeammates:")
             for t in self.teammates:
                 role = f" — {t.role}" if t.role else ""
-                parts.append(f"  - {t.name} (agent_id: {t.agent_id}){role} [{t.status}]")
+                model = f" [{t.model}]" if t.model else ""
+                parts.append(f"  - {t.name} (agent_id: {t.agent_id}){role}{model} [{t.status}]")
 
         if self.subagents:
             parts.append(f"\nSubagents ({len(self.subagents)}):")
@@ -468,6 +486,7 @@ def extract_team_state(messages: list[Message]) -> TeamState:
     state.teammates = list(seen_teammates.values())
     state.subagents = list(seen_subagents.values())
     state.tasks = list(seen_tasks.values())
+    state.config_source = "jsonl" if state.message_count > 0 else ""
 
     # Build lead summary from last few team-related assistant messages
     team_msgs: list[str] = []
@@ -482,6 +501,100 @@ def extract_team_state(messages: list[Message]) -> TeamState:
 
     if team_msgs:
         state.lead_summary = " [...] ".join(team_msgs[-3:])
+
+    # Merge with config.json ground truth (if available)
+    state = merge_config_into_state(state)
+
+    return state
+
+
+# ─── Config.json ground truth ─────────────────────────────────────────────
+
+def load_team_configs() -> list[dict]:
+    """Scan ~/.claude/teams/*/config.json for authoritative team configs.
+
+    Claude Code stores team configuration in ~/.claude/teams/<team-name>/config.json.
+    This is the ground truth for: team name, lead agent, session ID, members,
+    models, working directories.
+
+    Returns a list of parsed config dicts, one per team.
+    """
+    teams_dir = Path.home() / ".claude" / "teams"
+    configs = []
+    if not teams_dir.is_dir():
+        return configs
+
+    for config_file in teams_dir.glob("*/config.json"):
+        try:
+            data = json.loads(config_file.read_text())
+            data["_config_path"] = str(config_file)
+            configs.append(data)
+        except (json.JSONDecodeError, OSError):
+            continue
+
+    return configs
+
+
+def merge_config_into_state(state: TeamState, configs: list[dict] | None = None) -> TeamState:
+    """Merge config.json data into JSONL-extracted team state.
+
+    Config.json is authoritative for:
+      team name, lead agent ID, lead session ID, member details (model, cwd, agentType)
+
+    JSONL is authoritative for:
+      runtime state (subagent status, task progress, results)
+
+    If configs is None, loads from ~/.claude/teams/ automatically.
+    """
+    if configs is None:
+        configs = load_team_configs()
+
+    if not configs:
+        if not state.config_source:
+            state.config_source = "jsonl"
+        return state
+
+    # Match by team name if we have one from JSONL
+    matched_config = None
+    for cfg in configs:
+        if state.team_name and cfg.get("name") == state.team_name:
+            matched_config = cfg
+            break
+
+    if matched_config is None:
+        # No match by name — use most recent by createdAt
+        matched_config = max(configs, key=lambda c: c.get("createdAt", 0))
+
+    # Merge authoritative fields
+    state.team_name = matched_config.get("name", state.team_name)
+    state.lead_agent_id = matched_config.get("leadAgentId", state.lead_agent_id)
+    state.lead_session_id = matched_config.get("leadSessionId", state.lead_session_id)
+    state.config_source = "both" if state.message_count > 0 else "config.json"
+
+    # Merge member details
+    existing_teammates = {t.agent_id: t for t in state.teammates}
+    for member in matched_config.get("members", []):
+        agent_id = member.get("agentId", "")
+        if not agent_id:
+            continue
+
+        if agent_id in existing_teammates:
+            # Enrich existing teammate with config data
+            t = existing_teammates[agent_id]
+            t.model = member.get("model", t.model)
+            t.cwd = member.get("cwd", t.cwd)
+            if not t.role:
+                t.role = member.get("agentType", "")
+        else:
+            # Add from config (not seen in JSONL)
+            state.teammates.append(TeammateInfo(
+                agent_id=agent_id,
+                name=member.get("name", agent_id),
+                role=member.get("agentType", ""),
+                model=member.get("model", ""),
+                cwd=member.get("cwd", ""),
+                status="config",
+            ))
 
     return state
 
