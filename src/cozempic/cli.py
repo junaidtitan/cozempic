@@ -13,6 +13,7 @@ from .diagnosis import diagnose_session
 from .doctor import run_doctor
 from .executor import execute_actions, run_prescription
 from .guard import start_guard
+from .recap import save_recap
 from .registry import PRESCRIPTIONS, STRATEGIES
 from .session import find_current_session, find_sessions, load_messages, resolve_session, save_messages
 from .types import PrescriptionResult, StrategyResult
@@ -301,7 +302,13 @@ def cmd_reload(args):
     print(f"  Final size: {fmt_bytes(final_bytes)}")
     print()
 
-    # Step 2: Find Claude's parent PID and spawn watcher
+    # Step 2: Generate recap from the pruned messages
+    import tempfile
+    recap_path = Path(tempfile.gettempdir()) / f"cozempic_recap_{sess['session_id'][:8]}.txt"
+    save_recap(new_messages, recap_path)
+    print(f"  Recap saved to {recap_path}")
+
+    # Step 3: Find Claude's parent PID and spawn watcher
     claude_pid = _find_claude_pid()
     if not claude_pid:
         print("  WARNING: Could not detect Claude Code process.")
@@ -309,7 +316,7 @@ def cmd_reload(args):
         print("  Restart Claude manually with: claude --resume")
         return
 
-    _spawn_watcher(claude_pid, cwd)
+    _spawn_watcher(claude_pid, cwd, recap_path=recap_path)
     print(f"  Watcher spawned (watching Claude PID {claude_pid}).")
     print(f"  Now type /exit — a new terminal will open with 'claude --resume'.")
     print()
@@ -340,22 +347,28 @@ def _find_claude_pid() -> int | None:
     return None
 
 
-def _spawn_watcher(claude_pid: int, project_dir: str):
+def _spawn_watcher(claude_pid: int, project_dir: str, recap_path: Path | None = None):
     """Spawn a detached background process that waits for Claude to exit, then resumes."""
     system = platform.system()
 
+    # Build the command sequence: show recap, then launch claude --resume
+    recap_cmd = ""
+    if recap_path and recap_path.exists():
+        recap_cmd = f"cat {_shell_quote(str(recap_path))}; echo; "
+
     if system == "Darwin":
+        inner_cmd = f"cd {_shell_quote(project_dir)} && {recap_cmd}claude --resume"
         resume_cmd = (
             f"osascript -e 'tell application \"Terminal\" to do script "
-            f"\"cd {_shell_quote(project_dir)} && claude --resume\"'"
+            f"\"{inner_cmd}\"'"
         )
     elif system == "Linux":
-        # Try common terminal emulators
+        inner_cmd = f"cd {_shell_quote(project_dir)} && {recap_cmd}claude --resume; exec bash"
         resume_cmd = (
             f"if command -v gnome-terminal >/dev/null 2>&1; then "
-            f"gnome-terminal -- bash -c 'cd {_shell_quote(project_dir)} && claude --resume; exec bash'; "
+            f"gnome-terminal -- bash -c '{inner_cmd}'; "
             f"elif command -v xterm >/dev/null 2>&1; then "
-            f"xterm -e 'cd {_shell_quote(project_dir)} && claude --resume' & "
+            f"xterm -e '{inner_cmd}' & "
             f"else echo 'No terminal emulator found' >> /tmp/cozempic_reload.log; fi"
         )
     else:
