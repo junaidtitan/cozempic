@@ -127,7 +127,8 @@ def cmd_list(args):
 
 def cmd_current(args):
     cwd = args.cwd or None
-    sess = find_current_session(cwd)
+    match_text = getattr(args, "match", None)
+    sess = find_current_session(cwd, match_text=match_text)
     if not sess:
         print("Could not detect current session.", file=sys.stderr)
         print("Make sure you're running from a directory with a Claude Code project.", file=sys.stderr)
@@ -582,7 +583,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="cozempic",
         description="Context weight-loss tool for Claude Code — prune bloated JSONL conversation files",
     )
-    parser.add_argument("--version", action="version", version="%(prog)s 0.4.2")
+    parser.add_argument("--version", action="version", version="%(prog)s 0.4.3")
     sub = parser.add_subparsers(dest="command")
 
     session_help = "Session ID, UUID prefix, path, or 'current' for auto-detect"
@@ -594,6 +595,7 @@ def build_parser() -> argparse.ArgumentParser:
     # current
     p_current = sub.add_parser("current", help="Show current session for this project")
     p_current.add_argument("--cwd", help="Working directory (default: current)")
+    p_current.add_argument("--match", help="Text snippet to match against session content (for multi-session disambiguation)")
     p_current.add_argument("--diagnose", "-d", action="store_true", help="Also run diagnosis")
 
     # diagnose

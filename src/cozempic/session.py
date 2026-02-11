@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -78,26 +80,112 @@ def project_slug_to_path(slug: str) -> str:
     return slug.replace("-", "/")
 
 
-def find_current_session(cwd: str | None = None) -> dict | None:
-    """Find the most recently modified session for the current project.
+def _find_claude_pid() -> int | None:
+    """Walk up the process tree to find the Claude Code node process."""
+    try:
+        pid = os.getpid()
+        for _ in range(10):
+            result = subprocess.run(
+                ["ps", "-o", "pid=,ppid=,comm=", "-p", str(pid)],
+                capture_output=True, text=True,
+            )
+            parts = result.stdout.strip().split()
+            if len(parts) < 3:
+                break
+            ppid, comm = int(parts[1]), parts[2]
+            if "claude" in comm.lower():
+                return pid
+            pid = ppid
+            if pid <= 1:
+                break
+    except (ValueError, OSError):
+        pass
+    return None
 
-    Matches the CWD against Claude project directory names to find the right
-    project, then returns the most recently modified JSONL session.
 
-    Falls back to the most recently modified session across all projects
-    if no CWD match is found (handles cases where the slash command runs
-    from a different CWD than the project root).
+def _session_id_from_process() -> str | None:
+    """Detect the current session ID from Claude's open file descriptors.
+
+    Claude keeps .claude/tasks/<session-id>/ directories open. We can use
+    lsof to find the session UUID from the parent Claude process.
+    """
+    claude_pid = _find_claude_pid()
+    if not claude_pid:
+        return None
+
+    try:
+        result = subprocess.run(
+            ["lsof", "-p", str(claude_pid)],
+            capture_output=True, text=True, timeout=5,
+        )
+        import re
+        # Match UUID pattern in .claude/tasks/ paths
+        uuids = re.findall(
+            r'\.claude/tasks/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})',
+            result.stdout,
+        )
+        if uuids:
+            # Return the most common one (in case of duplicates)
+            from collections import Counter
+            return Counter(uuids).most_common(1)[0][0]
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    return None
+
+
+def _match_session_by_text(sessions: list[dict], match_text: str) -> dict | None:
+    """Find a session by matching text in its last N lines.
+
+    Searches the tail of each session file for the given text snippet.
+    Useful when multiple sessions are active and CWD/process detection fails.
+    """
+    for sess in sorted(sessions, key=lambda s: s["mtime"], reverse=True):
+        try:
+            with open(sess["path"], "r") as f:
+                # Read last 50 lines efficiently
+                lines = f.readlines()
+                tail = lines[-50:] if len(lines) > 50 else lines
+                tail_text = "".join(tail)
+                if match_text in tail_text:
+                    return sess
+        except (OSError, UnicodeDecodeError):
+            continue
+    return None
+
+
+def find_current_session(cwd: str | None = None, match_text: str | None = None) -> dict | None:
+    """Find the current Claude Code session using multiple strategies.
+
+    Detection priority:
+    1. Process-based: lsof on parent Claude process to find session UUID
+    2. Text matching: search session files for a unique text snippet
+    3. CWD slug: match working directory against project directory names
+    4. Fallback: most recently modified session across all projects
     """
     sessions = find_sessions()
     if not sessions:
         return None
 
+    # Strategy 1: Process-based detection (most reliable for active sessions)
+    proc_session_id = _session_id_from_process()
+    if proc_session_id:
+        for s in sessions:
+            if s["session_id"] == proc_session_id:
+                return s
+
+    # Strategy 2: Text matching (for multi-session disambiguation)
+    if match_text:
+        matched = _match_session_by_text(sessions, match_text)
+        if matched:
+            return matched
+
+    # Strategy 3: CWD slug match
     slug = cwd_to_project_slug(cwd)
     matching = [s for s in sessions if slug in s["project"]]
     if matching:
         return max(matching, key=lambda s: s["mtime"])
 
-    # Fallback: most recently modified session across all projects
+    # Strategy 4: Fallback to most recently modified
     return max(sessions, key=lambda s: s["mtime"])
 
 
