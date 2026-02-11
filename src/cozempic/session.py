@@ -69,6 +69,15 @@ def cwd_to_project_slug(cwd: str | None = None) -> str:
     return cwd.replace("/", "-")
 
 
+def project_slug_to_path(slug: str) -> str:
+    """Convert a Claude project slug back to a directory path.
+
+    e.g. -Users-foo-myproject -> /Users/foo/myproject
+    """
+    # Slug starts with '-' because paths start with '/'
+    return slug.replace("-", "/")
+
+
 def find_current_session(cwd: str | None = None) -> dict | None:
     """Find the most recently modified session for the current project.
 

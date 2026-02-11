@@ -247,6 +247,7 @@ def start_guard(
                     config=config,
                     auto_reload=auto_reload,
                     cwd=cwd or os.getcwd(),
+                    session_id=sess["session_id"],
                 )
 
                 if result.get("reloading"):
@@ -274,6 +275,7 @@ def start_guard(
                     config=config,
                     auto_reload=False,  # Never reload on soft prune
                     cwd=cwd or os.getcwd(),
+                    session_id=sess["session_id"],
                 )
 
                 print(f"  Trimmed: {result['saved_mb']:.1f}MB saved")
@@ -301,6 +303,7 @@ def guard_prune_cycle(
     config: dict | None = None,
     auto_reload: bool = True,
     cwd: str = "",
+    session_id: str | None = None,
 ) -> dict:
     """Execute a single guard prune cycle.
 
@@ -339,11 +342,12 @@ def guard_prune_cycle(
     if auto_reload:
         claude_pid = _find_claude_pid()
         if claude_pid:
-            _spawn_reload_watcher(claude_pid, cwd)
+            _spawn_reload_watcher(claude_pid, cwd, session_id=session_id)
             result["reloading"] = True
         else:
+            resume_flag = f"--resume {session_id}" if session_id else "--resume"
             print("  WARNING: Could not find Claude PID. Pruned but not reloading.")
-            print("  Restart manually: claude --resume")
+            print(f"  Restart manually: claude {resume_flag}")
 
     return result
 
@@ -378,26 +382,29 @@ def _shell_quote(s: str) -> str:
     return "'" + s.replace("'", "'\\''") + "'"
 
 
-def _spawn_reload_watcher(claude_pid: int, project_dir: str):
+def _spawn_reload_watcher(claude_pid: int, project_dir: str, session_id: str | None = None):
     """Spawn a detached watcher that resumes Claude after exit."""
     system = platform.system()
+
+    # Use session ID for precise resume targeting
+    resume_flag = f"--resume {session_id}" if session_id else "--resume"
 
     if system == "Darwin":
         resume_cmd = (
             f"osascript -e 'tell application \"Terminal\" to do script "
-            f"\"cd {_shell_quote(project_dir)} && claude --resume\"'"
+            f"\"cd {_shell_quote(project_dir)} && claude {resume_flag}\"'"
         )
     elif system == "Linux":
         resume_cmd = (
             f"if command -v gnome-terminal >/dev/null 2>&1; then "
-            f"gnome-terminal -- bash -c 'cd {_shell_quote(project_dir)} && claude --resume; exec bash'; "
+            f"gnome-terminal -- bash -c 'cd {_shell_quote(project_dir)} && claude {resume_flag}; exec bash'; "
             f"elif command -v xterm >/dev/null 2>&1; then "
-            f"xterm -e 'cd {_shell_quote(project_dir)} && claude --resume' & "
+            f"xterm -e 'cd {_shell_quote(project_dir)} && claude {resume_flag}' & "
             f"else echo 'No terminal emulator found' >> /tmp/cozempic_guard.log; fi"
         )
     elif system == "Windows":
         resume_cmd = (
-            f"start cmd /c \"cd /d {project_dir} && claude --resume\""
+            f"start cmd /c \"cd /d {project_dir} && claude {resume_flag}\""
         )
     else:
         print(f"  WARNING: Auto-resume not supported on {system}.")

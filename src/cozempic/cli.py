@@ -16,7 +16,7 @@ from .guard import checkpoint_team, start_guard, start_guard_daemon
 from .init import run_init
 from .recap import save_recap
 from .registry import PRESCRIPTIONS, STRATEGIES
-from .session import find_current_session, find_sessions, load_messages, resolve_session, save_messages
+from .session import find_current_session, find_sessions, load_messages, project_slug_to_path, resolve_session, save_messages
 from .types import PrescriptionResult, StrategyResult
 
 # Ensure all strategies are registered
@@ -266,6 +266,11 @@ def cmd_reload(args):
         print("Make sure you're running from a directory with a Claude Code project.", file=sys.stderr)
         sys.exit(1)
 
+    # Derive project directory from session slug (more reliable than CWD)
+    project_dir = project_slug_to_path(sess["project"])
+    if os.path.isdir(project_dir):
+        cwd = project_dir
+
     rx_name = args.rx or "standard"
     if rx_name not in PRESCRIPTIONS:
         print(f"Error: Unknown prescription '{rx_name}'. Options: {', '.join(PRESCRIPTIONS)}", file=sys.stderr)
@@ -317,7 +322,7 @@ def cmd_reload(args):
         print("  Restart Claude manually with: claude --resume")
         return
 
-    _spawn_watcher(claude_pid, cwd, recap_path=recap_path)
+    _spawn_watcher(claude_pid, cwd, recap_path=recap_path, session_id=sess["session_id"])
     print(f"  Watcher spawned (watching Claude PID {claude_pid}).")
     print(f"  Now type /exit — a new terminal will open with 'claude --resume'.")
     print()
@@ -348,7 +353,7 @@ def _find_claude_pid() -> int | None:
     return None
 
 
-def _spawn_watcher(claude_pid: int, project_dir: str, recap_path: Path | None = None):
+def _spawn_watcher(claude_pid: int, project_dir: str, recap_path: Path | None = None, session_id: str | None = None):
     """Spawn a detached background process that waits for Claude to exit, then resumes."""
     system = platform.system()
 
@@ -357,14 +362,17 @@ def _spawn_watcher(claude_pid: int, project_dir: str, recap_path: Path | None = 
     if recap_path and recap_path.exists():
         recap_cmd = f"cat {_shell_quote(str(recap_path))}; echo; "
 
+    # Use session ID for precise resume targeting
+    resume_flag = f"--resume {session_id}" if session_id else "--resume"
+
     if system == "Darwin":
-        inner_cmd = f"cd {_shell_quote(project_dir)} && {recap_cmd}claude --resume"
+        inner_cmd = f"cd {_shell_quote(project_dir)} && {recap_cmd}claude {resume_flag}"
         resume_cmd = (
             f"osascript -e 'tell application \"Terminal\" to do script "
             f"\"{inner_cmd}\"'"
         )
     elif system == "Linux":
-        inner_cmd = f"cd {_shell_quote(project_dir)} && {recap_cmd}claude --resume; exec bash"
+        inner_cmd = f"cd {_shell_quote(project_dir)} && {recap_cmd}claude {resume_flag}; exec bash"
         resume_cmd = (
             f"if command -v gnome-terminal >/dev/null 2>&1; then "
             f"gnome-terminal -- bash -c '{inner_cmd}'; "
@@ -374,7 +382,7 @@ def _spawn_watcher(claude_pid: int, project_dir: str, recap_path: Path | None = 
         )
     else:
         print(f"  WARNING: Auto-resume not supported on {system}.")
-        print(f"  Restart manually: cd {project_dir} && claude --resume")
+        print(f"  Restart manually: cd {project_dir} && claude {resume_flag}")
         return
 
     watcher_script = (
@@ -574,7 +582,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="cozempic",
         description="Context weight-loss tool for Claude Code — prune bloated JSONL conversation files",
     )
-    parser.add_argument("--version", action="version", version="%(prog)s 0.4.1")
+    parser.add_argument("--version", action="version", version="%(prog)s 0.4.2")
     sub = parser.add_subparsers(dest="command")
 
     session_help = "Session ID, UUID prefix, path, or 'current' for auto-detect"
