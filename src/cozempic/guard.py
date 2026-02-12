@@ -144,6 +144,7 @@ def start_guard(
     interval: int = 30,
     auto_reload: bool = True,
     config: dict | None = None,
+    reactive: bool = True,
 ) -> None:
     """Start the guard daemon with tiered pruning.
 
@@ -193,8 +194,28 @@ def start_guard(
     print(f"  Interval:    {interval}s")
     print(f"  Team-protect: enabled")
     print(f"  Checkpoint:  continuous (every {interval}s)")
+    print(f"  Reactive:    {'enabled' if reactive else 'disabled'}")
     print(f"\n  Guarding... (Ctrl+C to stop)")
     print()
+
+    # Reactive overflow recovery via file watcher
+    overflow_watcher = None
+    if reactive:
+        import threading
+        from .overflow import CircuitBreaker, OverflowRecovery
+        from .watcher import JsonlWatcher
+
+        breaker = CircuitBreaker(session_id=sess["session_id"])
+        recovery = OverflowRecovery(
+            session_path, sess["session_id"], cwd or os.getcwd(), breaker,
+        )
+        overflow_watcher = JsonlWatcher(
+            str(session_path), on_growth=recovery.on_file_growth,
+        )
+        watcher_thread = threading.Thread(
+            target=overflow_watcher.start, daemon=True, name="cozempic-watcher",
+        )
+        watcher_thread.start()
 
     prune_count = 0
     soft_prune_count = 0
@@ -287,6 +308,10 @@ def start_guard(
                 print()
 
     except KeyboardInterrupt:
+        # Stop reactive watcher
+        if overflow_watcher:
+            overflow_watcher.stop()
+
         # Final checkpoint before exit
         print(f"\n  [{_now()}] Final checkpoint before exit...")
         checkpoint_team(session_path=session_path, quiet=False)
@@ -461,6 +486,7 @@ def start_guard_daemon(
     rx_name: str = "standard",
     interval: int = 30,
     auto_reload: bool = True,
+    reactive: bool = True,
 ) -> dict:
     """Start the guard as a background daemon.
 
@@ -499,6 +525,8 @@ def start_guard_daemon(
         cmd_parts.extend(["--soft-threshold", str(soft_threshold_mb)])
     if not auto_reload:
         cmd_parts.append("--no-reload")
+    if not reactive:
+        cmd_parts.append("--no-reactive")
 
     # Spawn detached process
     with open(log_file, "a") as lf:

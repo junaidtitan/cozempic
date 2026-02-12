@@ -10,12 +10,13 @@ Claude Code context fills up with dead weight that wastes your token budget: hun
 
 When context gets too large, Claude's auto-compaction summarizes away critical state. For **Agent Teams**, this is catastrophic: the lead agent's context is compacted, team coordination messages (TeamCreate, SendMessage, TaskCreate/Update) are discarded, the lead forgets its teammates exist, and subagents are orphaned with no recovery path. ([#23620](https://github.com/anthropics/claude-code/issues/23620), [#23821](https://github.com/anthropics/claude-code/issues/23821), [#24052](https://github.com/anthropics/claude-code/issues/24052), [#21925](https://github.com/anthropics/claude-code/issues/21925))
 
-Cozempic prevents this with four layers of protection:
+Cozempic prevents this with five layers of protection:
 
 1. **Continuous checkpoint** — saves team state to disk every N seconds so it's always recoverable
 2. **Hook-driven checkpoint** — fires after every Task spawn, TaskCreate/Update, before compaction, and at session end
 3. **Tiered pruning** — soft threshold gently trims bloat without disruption; hard threshold does full prune + optional reload
-4. **Config.json ground truth** — reads `~/.claude/teams/*/config.json` for authoritative team state (lead, members, models, cwds)
+4. **Reactive overflow recovery** — kqueue/polling file watcher detects inbox-flood overflow within milliseconds, auto-prunes with escalating prescriptions, and resumes the session (~10s downtime vs permanently dead). Circuit breaker prevents infinite recovery loops. ([#23876](https://github.com/anthropics/claude-code/issues/23876))
+5. **Config.json ground truth** — reads `~/.claude/teams/*/config.json` for authoritative team state (lead, members, models, cwds)
 
 **Zero external dependencies.** Python 3.10+ stdlib only.
 
@@ -138,6 +139,7 @@ cozempic reload [-rx PRESET]                Treat + auto-resume in new terminal
 cozempic checkpoint [--show]                Save team/agent state to disk (no pruning)
 cozempic guard [--threshold MB]             Tiered guard: checkpoint + soft/hard prune
 cozempic guard --soft-threshold 25          Custom soft threshold (default: 60% of hard)
+cozempic guard --no-reactive                Disable reactive overflow recovery
 cozempic doctor [--fix]                     Check for known Claude Code issues
 cozempic formulary                          Show all strategies & prescriptions
 ```
@@ -207,13 +209,25 @@ The checkpoint is written to `.claude/projects/<project>/team-checkpoint.md`.
 
 ## Guard — Continuous Protection
 
-Guard is a background daemon with three phases:
+Guard is a background daemon with two complementary systems:
 
-**Phase 1: Continuous checkpoint** (every interval) — extracts team state and writes to disk. Lightweight read-only scan. Team state is always recoverable even if Claude crashes. Also merges `~/.claude/teams/*/config.json` as ground truth for team name, lead agent, member models, and working directories.
+**Proactive polling loop** (every N seconds):
 
-**Phase 2: Soft prune** (at soft threshold) — when file size crosses the soft threshold, applies a `gentle` prescription to trim easy bloat (progress ticks, metadata, stale reads). **No reload** — the session continues uninterrupted.
+- **Phase 1: Continuous checkpoint** — extracts team state and writes to disk. Lightweight read-only scan. Team state is always recoverable even if Claude crashes. Also merges `~/.claude/teams/*/config.json` as ground truth for team name, lead agent, member models, and working directories.
+- **Phase 2: Soft prune** (at soft threshold) — when file size crosses the soft threshold, applies a `gentle` prescription to trim easy bloat. **No reload** — the session continues uninterrupted.
+- **Phase 3: Hard prune** (at hard threshold) — applies the full prescription with team-protect, injects recovery messages, and optionally kills + resumes Claude.
 
-**Phase 3: Hard prune** (at hard threshold) — when file size crosses the hard threshold, applies the full prescription with team-protect, injects recovery messages, and optionally kills + resumes Claude.
+**Reactive overflow recovery** (sub-second, enabled by default):
+
+When agent team sessions go idle, Claude's InboxPoller can deliver all queued teammate messages at once, spiking the JSONL past the 200k token limit in seconds — faster than the polling loop can react. The reactive watcher uses kqueue (macOS, 0.04ms latency) or stat polling (Linux, 200ms) to detect this overflow within milliseconds. On detection:
+
+1. **Circuit breaker check** — prevents infinite prune → resume → crash loops (max 3 recoveries in 5 minutes)
+2. **Escalating prescription** — recovery #1 uses `gentle`, #2 uses `standard`, #3 uses `aggressive`
+3. **Pre-flight check** — if post-prune estimate is still too large, skips resume
+4. **Team-protected prune** → kill → auto-resume (~10s downtime vs permanently dead session)
+5. **Breaker trip** — after 3 rapid recoveries, halts with a clear message and saves a final checkpoint
+
+Disable with `--no-reactive` if needed. Zero impact on normal sessions — the watcher runs silently and fast-path exits for small files.
 
 The soft threshold defaults to 60% of the hard threshold. This gives a two-phase degradation: trim early and often, escalate only when needed.
 
@@ -226,6 +240,9 @@ cozempic guard --threshold 40 --soft-threshold 25 --interval 15 -rx standard
 
 # Without auto-reload (just clean, no restart)
 cozempic guard --threshold 50 --no-reload
+
+# Disable reactive overflow recovery (polling only)
+cozempic guard --no-reactive
 
 # Aggressive at hard threshold, gentle at soft (automatic)
 cozempic guard --threshold 30 -rx aggressive
@@ -244,6 +261,7 @@ Output:
   Interval:    30s
   Team-protect: enabled
   Checkpoint:  continuous (every 30s)
+  Reactive:    enabled
 
   Guarding... (Ctrl+C to stop)
 
@@ -344,6 +362,7 @@ This checkpoints team state:
 | **Guard (checkpoint)** | Every N seconds | Extract team state + config.json, write checkpoint |
 | **Guard (soft prune)** | At soft threshold (default 60% of hard) | Gentle prune, no reload, no disruption |
 | **Guard (hard prune)** | At hard threshold | Full prune + team-protect + optional reload |
+| **Guard (reactive)** | Sub-second file watcher (kqueue/polling) | Detect inbox-flood overflow → escalating prune → kill → resume |
 | **Reload** | Manual (`cozempic reload`) | One-shot prune + auto-resume |
 | **Checkpoint** | Manual (`cozempic checkpoint`) | One-shot state save |
 

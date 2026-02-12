@@ -427,6 +427,7 @@ def cmd_guard(args):
             rx_name=args.rx or "standard",
             interval=args.interval,
             auto_reload=not args.no_reload,
+            reactive=not args.no_reactive,
         )
         if result["already_running"]:
             print(f"  Guard already running (PID {result['pid']})")
@@ -442,6 +443,7 @@ def cmd_guard(args):
         rx_name=args.rx or "standard",
         interval=args.interval,
         auto_reload=not args.no_reload,
+        reactive=not args.no_reactive,
     )
 
 
@@ -583,7 +585,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="cozempic",
         description="Context weight-loss tool for Claude Code — prune bloated JSONL conversation files",
     )
-    parser.add_argument("--version", action="version", version="%(prog)s 0.4.3")
+    parser.add_argument("--version", action="version", version="%(prog)s 0.5.0")
     sub = parser.add_subparsers(dest="command")
 
     session_help = "Session ID, UUID prefix, path, or 'current' for auto-detect"
@@ -639,6 +641,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_guard.add_argument("--soft-threshold", type=float, default=None, help="Soft threshold in MB — gentle prune, no reload (default: 60%% of --threshold)")
     p_guard.add_argument("--interval", type=int, default=30, help="Check interval in seconds (default: 30)")
     p_guard.add_argument("--no-reload", action="store_true", help="Prune without auto-reload at hard threshold")
+    p_guard.add_argument("--no-reactive", action="store_true", help="Disable reactive overflow recovery (kqueue/polling watcher)")
     p_guard.add_argument("--daemon", action="store_true", help="Run in background (PID file prevents double-starts)")
 
     # init
