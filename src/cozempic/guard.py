@@ -28,6 +28,7 @@ from .helpers import shell_quote
 from .registry import PRESCRIPTIONS
 from .session import find_claude_pid, find_current_session, load_messages, save_messages
 from .team import TeamState, extract_team_state, inject_team_recovery, write_team_checkpoint
+from .tokens import quick_token_estimate
 
 
 # ─── Lightweight checkpoint (no prune) ───────────────────────────────────────
@@ -146,6 +147,8 @@ def start_guard(
     auto_reload: bool = True,
     config: dict | None = None,
     reactive: bool = True,
+    threshold_tokens: int | None = None,
+    soft_threshold_tokens: int | None = None,
 ) -> None:
     """Start the guard daemon with tiered pruning.
 
@@ -154,9 +157,8 @@ def start_guard(
       2. SOFT PRUNE at soft threshold — gentle prune, no reload, no disruption
       3. HARD PRUNE at hard threshold — full prune with team-protect + optional reload
 
-    The soft threshold acts as a first line of defense: it trims easy bloat
-    (progress ticks, metadata, stale reads) without disrupting the session.
-    The hard threshold is the emergency fallback when soft pruning isn't enough.
+    Thresholds can be bytes-based, token-based, or both. When both are set,
+    whichever is hit first triggers the action.
 
     Default soft threshold is 60% of hard threshold if not specified.
 
@@ -169,6 +171,8 @@ def start_guard(
         interval: Check interval in seconds.
         auto_reload: If True, kill Claude and auto-resume after hard prune.
         config: Extra config for pruning strategies.
+        threshold_tokens: Hard threshold in tokens (optional, checked alongside bytes).
+        soft_threshold_tokens: Soft threshold in tokens (optional, checked alongside bytes).
     """
     hard_threshold_bytes = int(threshold_mb * 1024 * 1024)
 
@@ -191,6 +195,10 @@ def start_guard(
     print(f"  Size:        {sess['size'] / 1024 / 1024:.1f}MB")
     print(f"  Soft:        {soft_threshold_mb}MB (gentle prune, no reload)")
     print(f"  Hard:        {threshold_mb}MB (full prune + {'reload' if auto_reload else 'no reload'})")
+    if soft_threshold_tokens is not None:
+        print(f"  Soft tokens: {soft_threshold_tokens:,}")
+    if threshold_tokens is not None:
+        print(f"  Hard tokens: {threshold_tokens:,}")
     print(f"  Rx:          gentle (soft) / {rx_name} (hard)")
     print(f"  Interval:    {interval}s")
     print(f"  Team-protect: enabled")
@@ -256,11 +264,23 @@ def start_guard(
                         f"({size_mb:.1f}MB)"
                     )
 
+            # ── Token check (fast, from tail of file) ────────────────
+            current_tokens = None
+            if threshold_tokens is not None or soft_threshold_tokens is not None:
+                current_tokens = quick_token_estimate(session_path)
+
             # ── Phase 3: HARD prune at hard threshold ─────────────────
-            if current_size >= hard_threshold_bytes:
+            hard_bytes_hit = current_size >= hard_threshold_bytes
+            hard_tokens_hit = (
+                threshold_tokens is not None
+                and current_tokens is not None
+                and current_tokens >= threshold_tokens
+            )
+            if hard_bytes_hit or hard_tokens_hit:
                 prune_count += 1
                 size_mb = current_size / 1024 / 1024
-                print(f"  [{_now()}] HARD THRESHOLD: {size_mb:.1f}MB >= {threshold_mb}MB")
+                reason = f"{size_mb:.1f}MB >= {threshold_mb}MB" if hard_bytes_hit else f"{current_tokens:,} tokens >= {threshold_tokens:,}"
+                print(f"  [{_now()}] HARD THRESHOLD: {reason}")
                 print(f"  Emergency prune with {rx_name} (cycle #{prune_count})...")
 
                 result = guard_prune_cycle(
@@ -285,28 +305,36 @@ def start_guard(
                 print()
 
             # ── Phase 2: SOFT prune at soft threshold ─────────────────
-            elif current_size >= soft_threshold_bytes:
-                soft_prune_count += 1
-                size_mb = current_size / 1024 / 1024
-                print(f"  [{_now()}] SOFT THRESHOLD: {size_mb:.1f}MB >= {soft_threshold_mb}MB")
-                print(f"  Gentle prune, no reload (cycle #{soft_prune_count})...")
-
-                result = guard_prune_cycle(
-                    session_path=session_path,
-                    rx_name="gentle",
-                    config=config,
-                    auto_reload=False,  # Never reload on soft prune
-                    cwd=cwd or os.getcwd(),
-                    session_id=sess["session_id"],
+            else:
+                soft_bytes_hit = current_size >= soft_threshold_bytes
+                soft_tokens_hit = (
+                    soft_threshold_tokens is not None
+                    and current_tokens is not None
+                    and current_tokens >= soft_threshold_tokens
                 )
+                if soft_bytes_hit or soft_tokens_hit:
+                    soft_prune_count += 1
+                    size_mb = current_size / 1024 / 1024
+                    reason = f"{size_mb:.1f}MB >= {soft_threshold_mb}MB" if soft_bytes_hit else f"{current_tokens:,} tokens >= {soft_threshold_tokens:,}"
+                    print(f"  [{_now()}] SOFT THRESHOLD: {reason}")
+                    print(f"  Gentle prune, no reload (cycle #{soft_prune_count})...")
 
-                print(f"  Trimmed: {result['saved_mb']:.1f}MB saved")
-                if result.get("team_name"):
-                    print(
-                        f"  Team '{result['team_name']}' state preserved "
-                        f"({result['team_messages']} messages)"
+                    result = guard_prune_cycle(
+                        session_path=session_path,
+                        rx_name="gentle",
+                        config=config,
+                        auto_reload=False,  # Never reload on soft prune
+                        cwd=cwd or os.getcwd(),
+                        session_id=sess["session_id"],
                     )
-                print()
+
+                    print(f"  Trimmed: {result['saved_mb']:.1f}MB saved")
+                    if result.get("team_name"):
+                        print(
+                            f"  Team '{result['team_name']}' state preserved "
+                            f"({result['team_messages']} messages)"
+                        )
+                    print()
 
     except KeyboardInterrupt:
         # Stop reactive watcher
@@ -458,6 +486,8 @@ def start_guard_daemon(
     interval: int = 30,
     auto_reload: bool = True,
     reactive: bool = True,
+    threshold_tokens: int | None = None,
+    soft_threshold_tokens: int | None = None,
 ) -> dict:
     """Start the guard as a background daemon.
 
@@ -498,6 +528,10 @@ def start_guard_daemon(
         cmd_parts.append("--no-reload")
     if not reactive:
         cmd_parts.append("--no-reactive")
+    if threshold_tokens is not None:
+        cmd_parts.extend(["--threshold-tokens", str(threshold_tokens)])
+    if soft_threshold_tokens is not None:
+        cmd_parts.extend(["--soft-threshold-tokens", str(soft_threshold_tokens)])
 
     # Spawn detached process
     with open(log_file, "a", encoding="utf-8") as lf:

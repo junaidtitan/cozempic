@@ -6,6 +6,7 @@ import json
 import re
 
 from .helpers import get_content_blocks, get_msg_type, text_of
+from .tokens import estimate_session_tokens
 from .types import Message
 
 
@@ -61,6 +62,8 @@ def diagnose_session(messages: list[Message]) -> dict:
             if text:
                 reminder_count += len(reminder_pattern.findall(text))
 
+    token_estimate = estimate_session_tokens(messages)
+
     return {
         "total_bytes": total_bytes,
         "total_messages": total_messages,
@@ -72,4 +75,5 @@ def diagnose_session(messages: list[Message]) -> dict:
         "progress_count": progress_count,
         "file_history_count": file_history_count,
         "reminder_count": reminder_count,
+        "token_estimate": token_estimate,
     }

@@ -114,12 +114,14 @@ class OverflowRecovery:
         cwd: str,
         breaker: CircuitBreaker,
         danger_threshold_mb: float = 90.0,
+        danger_threshold_tokens: int | None = None,
     ):
         self.session_path = session_path
         self.session_id = session_id
         self.cwd = cwd
         self.breaker = breaker
         self.danger_threshold_bytes = int(danger_threshold_mb * 1024 * 1024)
+        self.danger_threshold_tokens = danger_threshold_tokens
         self._recovering = False  # Prevent re-entrant recovery
 
     def detect_overflow(self) -> bool:
@@ -143,8 +145,18 @@ class OverflowRecovery:
 
     def on_file_growth(self, filepath: str, new_size: int) -> None:
         """Callback wired to JsonlWatcher. Fast-path for normal growth."""
-        # Fast path: small file, nothing to worry about
-        if new_size < self.danger_threshold_bytes:
+        # Fast path: check bytes threshold
+        bytes_danger = new_size >= self.danger_threshold_bytes
+
+        # Check token threshold if configured
+        tokens_danger = False
+        if self.danger_threshold_tokens is not None and not bytes_danger:
+            from .tokens import quick_token_estimate
+            tok = quick_token_estimate(self.session_path)
+            if tok is not None and tok >= self.danger_threshold_tokens:
+                tokens_danger = True
+
+        if not bytes_danger and not tokens_danger:
             return
 
         # Prevent re-entrant recovery

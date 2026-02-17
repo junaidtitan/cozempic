@@ -18,6 +18,7 @@ from .recap import save_recap
 from .registry import PRESCRIPTIONS, STRATEGIES
 from .helpers import shell_quote
 from .session import find_claude_pid, find_current_session, find_sessions, load_messages, project_slug_to_path, resolve_session, save_messages
+from .tokens import estimate_session_tokens, quick_token_estimate
 from .types import PrescriptionResult, StrategyResult
 
 # Ensure all strategies are registered
@@ -46,10 +47,32 @@ def fmt_pct(part: int, total: int) -> str:
     return f"{part / total * 100:.1f}%"
 
 
+def fmt_tokens(t: int) -> str:
+    if t < 1000:
+        return f"{t}"
+    elif t < 1_000_000:
+        return f"{t / 1000:.1f}K"
+    else:
+        return f"{t / 1_000_000:.2f}M"
+
+
+def fmt_context_bar(pct: float, width: int = 20) -> str:
+    filled = int(round(pct / 100 * width))
+    filled = max(0, min(filled, width))
+    bar = "=" * filled + "-" * (width - filled)
+    return f"[{bar}] {pct:.0f}%"
+
+
 def print_diagnosis(diag: dict, path: Path):
     total = diag["total_bytes"]
     print(f"\n  Patient: {path.stem}")
     print(f"  Weight:  {fmt_bytes(total)} ({diag['total_messages']} messages)")
+
+    te = diag.get("token_estimate")
+    if te:
+        confidence = f", {te.confidence}" if te.method == "heuristic" else ""
+        print(f"  Tokens:  {fmt_tokens(te.total)} ({te.method}{confidence})")
+        print(f"  Context: {fmt_context_bar(te.context_pct)}")
     print()
 
     print("  Vital Signs:")
@@ -98,6 +121,13 @@ def print_prescription_result(pr: PrescriptionResult):
     print(f"  Before: {fmt_bytes(pr.original_total_bytes)} ({pr.original_message_count} messages)")
     print(f"  After:  {fmt_bytes(pr.final_total_bytes)} ({pr.final_message_count} messages)")
     print(f"  Saved:  {fmt_bytes(saved)} ({pct}) — {removed} removed, {total_replaced} modified")
+
+    if pr.original_tokens is not None and pr.final_tokens is not None:
+        tok_saved = pr.original_tokens - pr.final_tokens
+        tok_pct = f"{tok_saved / pr.original_tokens * 100:.1f}%" if pr.original_tokens > 0 else "0%"
+        method = f" ({pr.token_method})" if pr.token_method else ""
+        print(f"  Tokens: {fmt_tokens(pr.original_tokens)} -> {fmt_tokens(pr.final_tokens)} ({fmt_tokens(tok_saved)} freed, {tok_pct}){method}")
+
     print()
     print("  Strategy Results:")
     for sr in pr.strategy_results:
@@ -113,15 +143,17 @@ def cmd_list(args):
         print("No sessions found.")
         return
 
-    print(f"\n  {'Session ID':<40} {'Size':>10} {'Messages':>8} {'Modified':<20} Project")
-    print(f"  {'─' * 40} {'─' * 10} {'─' * 8} {'─' * 20} {'─' * 30}")
+    print(f"\n  {'Session ID':<40} {'Size':>10} {'Tokens':>8} {'Messages':>8} {'Modified':<20} Project")
+    print(f"  {'─' * 40} {'─' * 10} {'─' * 8} {'─' * 8} {'─' * 20} {'─' * 30}")
 
     for sess in sorted(sessions, key=lambda s: s["size"], reverse=True):
         sid = sess["session_id"]
         if len(sid) > 36:
             sid = sid[:33] + "..."
+        tok = quick_token_estimate(sess["path"])
+        tok_str = fmt_tokens(tok) if tok is not None else "—"
         print(
-            f"  {sid:<40} {fmt_bytes(sess['size']):>10} {sess['lines']:>8}"
+            f"  {sid:<40} {fmt_bytes(sess['size']):>10} {tok_str:>8} {sess['lines']:>8}"
             f" {sess['mtime'].strftime('%Y-%m-%d %H:%M'):<20} {sess['project'][-40:]}"
         )
     print()
@@ -143,6 +175,13 @@ def cmd_current(args):
     print(f"\n  Current Session:")
     print(f"    ID:      {sess['session_id']}")
     print(f"    Size:    {fmt_bytes(sess['size'])} ({sess['lines']} messages)")
+
+    tok = quick_token_estimate(sess["path"])
+    if tok is not None:
+        from .tokens import DEFAULT_CONTEXT_WINDOW
+        pct = round(tok / DEFAULT_CONTEXT_WINDOW * 100, 1)
+        print(f"    Tokens:  {fmt_tokens(tok)} {fmt_context_bar(pct)}")
+
     print(f"    Project: {sess['project']}")
     print(f"    Path:    {sess['path']}")
     print(f"    Modified: {sess['mtime'].strftime('%Y-%m-%d %H:%M:%S')}")
@@ -196,9 +235,15 @@ def cmd_treat(args):
     original_bytes = sum(b for _, _, b in messages)
     original_count = len(messages)
 
+    # Token estimate before pruning
+    pre_te = estimate_session_tokens(messages)
+
     new_messages, strategy_results = run_prescription(messages, strategy_names, config)
     final_bytes = sum(b for _, _, b in new_messages)
     final_count = len(new_messages)
+
+    # Token estimate after pruning
+    post_te = estimate_session_tokens(new_messages)
 
     pr = PrescriptionResult(
         prescription_name=rx_name,
@@ -207,6 +252,9 @@ def cmd_treat(args):
         final_total_bytes=final_bytes,
         original_message_count=original_count,
         final_message_count=final_count,
+        original_tokens=pre_te.total,
+        final_tokens=post_te.total,
+        token_method=pre_te.method,
     )
 
     print_prescription_result(pr)
@@ -294,9 +342,15 @@ def cmd_reload(args):
     original_bytes = sum(b for _, _, b in messages)
     original_count = len(messages)
 
+    # Token estimate before pruning
+    pre_te = estimate_session_tokens(messages)
+
     new_messages, strategy_results = run_prescription(messages, strategy_names, config)
     final_bytes = sum(b for _, _, b in new_messages)
     final_count = len(new_messages)
+
+    # Token estimate after pruning
+    post_te = estimate_session_tokens(new_messages)
 
     pr = PrescriptionResult(
         prescription_name=rx_name,
@@ -305,6 +359,9 @@ def cmd_reload(args):
         final_total_bytes=final_bytes,
         original_message_count=original_count,
         final_message_count=final_count,
+        original_tokens=pre_te.total,
+        final_tokens=post_te.total,
+        token_method=pre_te.method,
     )
     print_prescription_result(pr)
 
@@ -404,6 +461,8 @@ def cmd_guard(args):
             interval=args.interval,
             auto_reload=not args.no_reload,
             reactive=not args.no_reactive,
+            threshold_tokens=args.threshold_tokens,
+            soft_threshold_tokens=args.soft_threshold_tokens,
         )
         if result["already_running"]:
             print(f"  Guard already running (PID {result['pid']})")
@@ -420,6 +479,8 @@ def cmd_guard(args):
         interval=args.interval,
         auto_reload=not args.no_reload,
         reactive=not args.no_reactive,
+        threshold_tokens=args.threshold_tokens,
+        soft_threshold_tokens=args.soft_threshold_tokens,
     )
 
 
@@ -616,6 +677,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_guard.add_argument("--threshold", type=float, default=50.0, help="Hard threshold in MB — full prune + reload (default: 50)")
     p_guard.add_argument("--soft-threshold", type=float, default=None, help="Soft threshold in MB — gentle prune, no reload (default: 60%% of --threshold)")
     p_guard.add_argument("--interval", type=int, default=30, help="Check interval in seconds (default: 30)")
+    p_guard.add_argument("--threshold-tokens", type=int, default=None, help="Hard threshold in tokens (checked alongside --threshold)")
+    p_guard.add_argument("--soft-threshold-tokens", type=int, default=None, help="Soft threshold in tokens (checked alongside --soft-threshold)")
     p_guard.add_argument("--no-reload", action="store_true", help="Prune without auto-reload at hard threshold")
     p_guard.add_argument("--no-reactive", action="store_true", help="Disable reactive overflow recovery (kqueue/polling watcher)")
     p_guard.add_argument("--daemon", action="store_true", help="Run in background (PID file prevents double-starts)")

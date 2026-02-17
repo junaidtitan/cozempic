@@ -42,6 +42,9 @@ class PrescriptionResult:
     final_total_bytes: int
     original_message_count: int
     final_message_count: int
+    original_tokens: int | None = None
+    final_tokens: int | None = None
+    token_method: str | None = None
 
 
 @dataclass
