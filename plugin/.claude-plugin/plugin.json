@@ -1,0 +1,12 @@
+{
+  "name": "cozempic",
+  "version": "0.6.2",
+  "description": "Context weight-loss for Claude Code — prune bloated sessions, protect agent teams from compaction",
+  "author": {
+    "name": "Ruya AI",
+    "url": "https://github.com/Ruya-AI"
+  },
+  "repository": "https://github.com/Ruya-AI/cozempic",
+  "license": "MIT",
+  "keywords": ["context", "pruning", "compaction", "agent-teams", "tokens"]
+}
