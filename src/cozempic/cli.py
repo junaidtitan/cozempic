@@ -16,7 +16,7 @@ from .guard import checkpoint_team, start_guard, start_guard_daemon
 from .init import run_init
 from .recap import save_recap
 from .registry import PRESCRIPTIONS, STRATEGIES
-from .helpers import shell_quote
+from .helpers import is_ssh_session, shell_quote
 from .session import find_claude_pid, find_current_session, find_sessions, load_messages, project_slug_to_path, resolve_session, save_messages
 from .tokens import estimate_session_tokens, quick_token_estimate
 from .types import PrescriptionResult, StrategyResult
@@ -394,15 +394,21 @@ def cmd_reload(args):
 
 def _spawn_watcher(claude_pid: int, project_dir: str, recap_path: Path | None = None, session_id: str | None = None):
     """Spawn a detached background process that waits for Claude to exit, then resumes."""
+    resume_flag = f"--resume {session_id}" if session_id else "--resume"
+
+    # SSH sessions can't open GUI terminals — tell the user to resume manually
+    if is_ssh_session():
+        print(f"  SSH session detected — auto-resume is not available over SSH.")
+        print(f"  After exiting, resume manually:")
+        print(f"    cd {project_dir} && claude {resume_flag}")
+        return
+
     system = platform.system()
 
     # Build the command sequence: show recap, then launch claude --resume
     recap_cmd = ""
     if recap_path and recap_path.exists():
         recap_cmd = f"cat {shell_quote(str(recap_path))}; echo; "
-
-    # Use session ID for precise resume targeting
-    resume_flag = f"--resume {session_id}" if session_id else "--resume"
 
     if system == "Darwin":
         inner_cmd = f"cd {shell_quote(project_dir)} && {recap_cmd}claude {resume_flag}"
@@ -622,7 +628,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="cozempic",
         description="Context weight-loss tool for Claude Code — prune bloated JSONL conversation files",
     )
-    parser.add_argument("--version", action="version", version="%(prog)s 0.6.1")
+    parser.add_argument("--version", action="version", version="%(prog)s 0.6.2")
     sub = parser.add_subparsers(dest="command")
 
     session_help = "Session ID, UUID prefix, path, or 'current' for auto-detect"

@@ -45,6 +45,16 @@ def shell_quote(s: str) -> str:
     return "'" + s.replace("'", "'\\''") + "'"
 
 
+def is_ssh_session() -> bool:
+    """Detect if we're running inside an SSH session."""
+    import os
+    return bool(
+        os.environ.get("SSH_TTY")
+        or os.environ.get("SSH_CONNECTION")
+        or os.environ.get("SSH_CLIENT")
+    )
+
+
 def text_of(block: dict) -> str:
     """Get the text content of a content block, handling all block types."""
     result = block.get("text", "") or block.get("thinking", "") or block.get("content", "")

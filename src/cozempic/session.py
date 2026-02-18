@@ -82,6 +82,8 @@ def project_slug_to_path(slug: str) -> str:
 
 def find_claude_pid() -> int | None:
     """Walk up the process tree to find the Claude Code node process."""
+    from .helpers import is_ssh_session
+
     try:
         pid = os.getpid()
         for _ in range(10):
@@ -100,7 +102,10 @@ def find_claude_pid() -> int | None:
                 break
     except (ValueError, OSError):
         pass
-    # Fallback: PPID is often Claude when invoked from within a session
+    # Fallback: PPID is often Claude when invoked from within a session.
+    # Skip over SSH — PPID would be the SSH shell, not Claude.
+    if is_ssh_session():
+        return None
     ppid = os.getppid()
     if ppid > 1:
         return ppid

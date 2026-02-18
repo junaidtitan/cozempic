@@ -24,7 +24,7 @@ import time
 from pathlib import Path
 
 from .executor import run_prescription
-from .helpers import shell_quote
+from .helpers import is_ssh_session, shell_quote
 from .registry import PRESCRIPTIONS
 from .session import find_claude_pid, find_current_session, load_messages, save_messages
 from .team import TeamState, extract_team_state, inject_team_recovery, write_team_checkpoint
@@ -408,10 +408,15 @@ def guard_prune_cycle(
 
 def _spawn_reload_watcher(claude_pid: int, project_dir: str, session_id: str | None = None):
     """Spawn a detached watcher that resumes Claude after exit."""
-    system = platform.system()
-
-    # Use session ID for precise resume targeting
     resume_flag = f"--resume {session_id}" if session_id else "--resume"
+
+    # SSH sessions can't open GUI terminals — skip auto-resume
+    if is_ssh_session():
+        print(f"  SSH session detected — skipping auto-resume.")
+        print(f"  Resume manually: cd {project_dir} && claude {resume_flag}")
+        return
+
+    system = platform.system()
 
     if system == "Darwin":
         resume_cmd = (
