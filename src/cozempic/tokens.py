@@ -19,8 +19,10 @@ DEFAULT_CONTEXT_WINDOW = 200_000
 SYSTEM_OVERHEAD_TOKENS = 21_000
 
 # Model → context window mapping
+# Note: claude-opus-4-6 has 200K by default. 1M is beta-only via API header.
+# Use COZEMPIC_CONTEXT_WINDOW env var or --context-window flag to override.
 MODEL_CONTEXT_WINDOWS: dict[str, int] = {
-    "claude-opus-4-6": 1_000_000,
+    "claude-opus-4-6": 200_000,
     "claude-opus-4-5": 200_000,
     "claude-sonnet-4-6": 200_000,
     "claude-sonnet-4-5": 200_000,
@@ -31,6 +33,18 @@ MODEL_CONTEXT_WINDOWS: dict[str, int] = {
     "claude-3-sonnet": 200_000,
     "claude-3-haiku": 200_000,
 }
+
+
+def get_context_window_override() -> int | None:
+    """Check for user override via COZEMPIC_CONTEXT_WINDOW env var."""
+    import os
+    val = os.environ.get("COZEMPIC_CONTEXT_WINDOW")
+    if val:
+        try:
+            return int(val)
+        except ValueError:
+            pass
+    return None
 
 # Chars-per-token defaults (conservative)
 CHARS_PER_TOKEN_CODE = 3.5
@@ -59,9 +73,15 @@ def detect_model(messages: list[Message]) -> str | None:
 def detect_context_window(messages: list[Message]) -> int:
     """Detect the context window size from the session's model.
 
-    Returns the context window in tokens. Falls back to DEFAULT_CONTEXT_WINDOW
-    if the model is unknown or undetectable.
+    Priority:
+    1. COZEMPIC_CONTEXT_WINDOW env var (user override)
+    2. Model detection from session data
+    3. DEFAULT_CONTEXT_WINDOW (200K)
     """
+    override = get_context_window_override()
+    if override:
+        return override
+
     model = detect_model(messages)
     if model:
         # Exact match first

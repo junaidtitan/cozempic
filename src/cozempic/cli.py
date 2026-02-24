@@ -650,7 +650,8 @@ def build_parser() -> argparse.ArgumentParser:
         prog="cozempic",
         description="Context weight-loss tool for Claude Code — prune bloated JSONL conversation files",
     )
-    parser.add_argument("--version", action="version", version="%(prog)s 0.7.2")
+    parser.add_argument("--version", action="version", version="%(prog)s 0.7.3")
+    parser.add_argument("--context-window", type=int, default=None, help="Override context window size in tokens (e.g. 1000000 for 1M beta)")
     sub = parser.add_subparsers(dest="command")
 
     session_help = "Session ID, UUID prefix, path, or 'current' for auto-detect"
@@ -729,6 +730,10 @@ def build_parser() -> argparse.ArgumentParser:
 def main():
     parser = build_parser()
     args = parser.parse_args()
+
+    # Set context window override if provided
+    if args.context_window:
+        os.environ["COZEMPIC_CONTEXT_WINDOW"] = str(args.context_window)
 
     if not args.command:
         parser.print_help()
