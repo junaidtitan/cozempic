@@ -480,6 +480,8 @@ def cmd_checkpoint(args):
 
 def cmd_guard(args):
     """Start the guard daemon to prevent compaction-induced state loss."""
+    session_id = args.session or None
+
     if args.daemon:
         result = start_guard_daemon(
             cwd=args.cwd or os.getcwd(),
@@ -491,6 +493,7 @@ def cmd_guard(args):
             reactive=not args.no_reactive,
             threshold_tokens=args.threshold_tokens,
             soft_threshold_tokens=args.soft_threshold_tokens,
+            session_id=session_id,
         )
         if result["already_running"]:
             print(f"  Guard already running (PID {result['pid']})")
@@ -509,6 +512,7 @@ def cmd_guard(args):
         reactive=not args.no_reactive,
         threshold_tokens=args.threshold_tokens,
         soft_threshold_tokens=args.soft_threshold_tokens,
+        session_id=session_id,
     )
 
 
@@ -650,7 +654,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="cozempic",
         description="Context weight-loss tool for Claude Code — prune bloated JSONL conversation files",
     )
-    parser.add_argument("--version", action="version", version="%(prog)s 0.7.3")
+    parser.add_argument("--version", action="version", version="%(prog)s 0.7.4")
     parser.add_argument("--context-window", type=int, default=None, help="Override context window size in tokens (e.g. 1000000 for 1M beta)")
     sub = parser.add_subparsers(dest="command")
 
@@ -711,6 +715,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_guard.add_argument("--no-reload", action="store_true", help="Prune without auto-reload at hard threshold")
     p_guard.add_argument("--no-reactive", action="store_true", help="Disable reactive overflow recovery (kqueue/polling watcher)")
     p_guard.add_argument("--daemon", action="store_true", help="Run in background (PID file prevents double-starts)")
+    p_guard.add_argument("--session", help="Explicit session ID or path (bypasses auto-detection)")
 
     # init
     p_init = sub.add_parser("init", help="Auto-wire hooks and slash command into this project")

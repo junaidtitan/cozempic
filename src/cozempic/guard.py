@@ -26,9 +26,26 @@ from pathlib import Path
 from .executor import run_prescription
 from .helpers import is_ssh_session, shell_quote
 from .registry import PRESCRIPTIONS
-from .session import find_claude_pid, find_current_session, load_messages, save_messages
+from .session import find_claude_pid, find_current_session, find_sessions, load_messages, save_messages
 from .team import TeamState, extract_team_state, inject_team_recovery, write_team_checkpoint
 from .tokens import quick_token_estimate
+
+
+def _resolve_session_by_id(session_id: str) -> dict | None:
+    """Find a session by explicit ID, UUID prefix, or path."""
+    p = Path(session_id)
+    if p.exists() and p.suffix == ".jsonl":
+        return {
+            "path": p,
+            "session_id": p.stem,
+            "size": p.stat().st_size,
+            "project": p.parent.name,
+        }
+
+    for sess in find_sessions():
+        if sess["session_id"] == session_id or sess["session_id"].startswith(session_id):
+            return sess
+    return None
 
 
 # ─── Lightweight checkpoint (no prune) ───────────────────────────────────────
@@ -149,6 +166,7 @@ def start_guard(
     reactive: bool = True,
     threshold_tokens: int | None = None,
     soft_threshold_tokens: int | None = None,
+    session_id: str | None = None,
 ) -> None:
     """Start the guard daemon with tiered pruning.
 
@@ -173,6 +191,7 @@ def start_guard(
         config: Extra config for pruning strategies.
         threshold_tokens: Hard threshold in tokens (optional, checked alongside bytes).
         soft_threshold_tokens: Soft threshold in tokens (optional, checked alongside bytes).
+        session_id: Explicit session ID to monitor (bypasses auto-detection).
     """
     hard_threshold_bytes = int(threshold_mb * 1024 * 1024)
 
@@ -180,11 +199,15 @@ def start_guard(
         soft_threshold_mb = round(threshold_mb * 0.6, 1)
     soft_threshold_bytes = int(soft_threshold_mb * 1024 * 1024)
 
-    # Find the initial session first
-    sess = find_current_session(cwd)
+    # Find the session — explicit ID or auto-detect
+    if session_id:
+        sess = _resolve_session_by_id(session_id)
+    else:
+        sess = find_current_session(cwd)
     if not sess:
         print("  ERROR: Could not detect current session.", file=sys.stderr)
-        print("  Make sure you're running from a directory with a Claude Code project.", file=sys.stderr)
+        if not session_id:
+            print("  Tip: Use --session <session_id> for explicit targeting.", file=sys.stderr)
         sys.exit(1)
 
     session_path = sess["path"]
@@ -503,6 +526,7 @@ def start_guard_daemon(
     reactive: bool = True,
     threshold_tokens: int | None = None,
     soft_threshold_tokens: int | None = None,
+    session_id: str | None = None,
 ) -> dict:
     """Start the guard as a background daemon.
 
@@ -547,6 +571,8 @@ def start_guard_daemon(
         cmd_parts.extend(["--threshold-tokens", str(threshold_tokens)])
     if soft_threshold_tokens is not None:
         cmd_parts.extend(["--soft-threshold-tokens", str(soft_threshold_tokens)])
+    if session_id is not None:
+        cmd_parts.extend(["--session", session_id])
 
     # Spawn detached process
     with open(log_file, "a", encoding="utf-8") as lf:
