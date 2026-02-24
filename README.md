@@ -429,6 +429,7 @@ Current checks:
 | Check | What It Detects |
 |-------|----------------|
 | `trust-dialog-hang` | `hasTrustDialogAccepted=true` in `~/.claude.json` causing resume hangs on Windows |
+| `corrupted-tool-use` | `tool_use.name` >200 chars from serialization bugs — causes unrecoverable 400 errors ([#25812](https://github.com/anthropics/claude-code/issues/25812)) |
 | `oversized-sessions` | Session files >50MB likely to hang on resume |
 | `stale-backups` | Old `.bak` files from previous treatments wasting disk |
 | `disk-usage` | Total session storage exceeding healthy thresholds |

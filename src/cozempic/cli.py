@@ -654,7 +654,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="cozempic",
         description="Context weight-loss tool for Claude Code — prune bloated JSONL conversation files",
     )
-    parser.add_argument("--version", action="version", version="%(prog)s 0.7.4")
+    parser.add_argument("--version", action="version", version="%(prog)s 0.7.5")
     parser.add_argument("--context-window", type=int, default=None, help="Override context window size in tokens (e.g. 1000000 for 1M beta)")
     sub = parser.add_subparsers(dest="command")
 

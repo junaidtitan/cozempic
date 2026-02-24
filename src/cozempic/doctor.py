@@ -213,11 +213,165 @@ def check_disk_usage() -> CheckResult:
     )
 
 
+def check_corrupted_tool_use() -> CheckResult:
+    """Check for corrupted tool_use blocks where parameters are merged into the name field.
+
+    Claude Code can corrupt tool_use blocks during serialization (especially
+    with parallel Task calls or after compaction), flattening input parameters
+    into the name field. This produces names >200 chars, causing unrecoverable
+    400 API errors on resume.
+
+    Ref: anthropics/claude-code#25812
+    """
+    sessions = find_sessions()
+    corrupted_sessions = []
+
+    for sess in sessions:
+        try:
+            count = _count_corrupted_tool_use(sess["path"])
+            if count > 0:
+                corrupted_sessions.append((sess, count))
+        except (OSError, UnicodeDecodeError):
+            continue
+
+    if not corrupted_sessions:
+        return CheckResult(
+            name="corrupted-tool-use",
+            status="ok",
+            message=f"No corrupted tool_use blocks found ({len(sessions)} sessions checked)",
+        )
+
+    details = ", ".join(
+        f"{s['session_id'][:8]}…({count} blocks)"
+        for s, count in sorted(corrupted_sessions, key=lambda x: x[1], reverse=True)[:5]
+    )
+    total = sum(c for _, c in corrupted_sessions)
+
+    return CheckResult(
+        name="corrupted-tool-use",
+        status="issue",
+        message=(
+            f"{total} corrupted tool_use block(s) in {len(corrupted_sessions)} session(s): {details}. "
+            f"These cause 400 API errors on resume (name >200 chars)."
+        ),
+        fix_description="Repair corrupted tool_use blocks (restore name + reconstruct input params)",
+    )
+
+
+def _count_corrupted_tool_use(path: Path) -> int:
+    """Count corrupted tool_use blocks in a session file."""
+    import json as _json
+    count = 0
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = _json.loads(line)
+            except _json.JSONDecodeError:
+                continue
+            content = obj.get("message", {}).get("content", [])
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if block.get("type") == "tool_use" and len(block.get("name", "")) > 200:
+                    count += 1
+    return count
+
+
+def fix_corrupted_tool_use() -> str:
+    """Repair corrupted tool_use blocks across all sessions.
+
+    Parses the corrupted name field (which contains flattened XML-style
+    parameters) back into proper name + input fields.
+    """
+    import html
+    import re
+    import shutil
+
+    sessions = find_sessions()
+    total_fixed = 0
+    sessions_fixed = 0
+
+    for sess in sessions:
+        path = sess["path"]
+        try:
+            count = _count_corrupted_tool_use(path)
+            if count == 0:
+                continue
+        except (OSError, UnicodeDecodeError):
+            continue
+
+        # Backup before modifying
+        from datetime import datetime as _dt
+        ts = _dt.now().strftime("%Y%m%d_%H%M%S")
+        backup = path.with_suffix(f".{ts}.jsonl.bak")
+        shutil.copy2(path, backup)
+
+        lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+        fixed_in_session = 0
+
+        for idx, line in enumerate(lines):
+            line_stripped = line.strip()
+            if not line_stripped:
+                continue
+            try:
+                obj = json.loads(line_stripped)
+            except json.JSONDecodeError:
+                continue
+
+            content = obj.get("message", {}).get("content", [])
+            if not isinstance(content, list):
+                continue
+
+            changed = False
+            for block in content:
+                if block.get("type") != "tool_use":
+                    continue
+                name = block.get("name", "")
+                if len(name) <= 200:
+                    continue
+
+                # Parse corrupted name: 'ToolName" key1="val1" key2="val2"...'
+                tool_name = name.split('"')[0].strip()
+                params = {}
+                keys = re.findall(r'(\w+)="', name)
+                for i, key in enumerate(keys):
+                    marker = key + '="'
+                    start = name.index(marker) + len(marker)
+                    if i + 1 < len(keys):
+                        next_marker = keys[i + 1] + '="'
+                        end = name.index(next_marker, start)
+                        value = name[start:end].rstrip().rstrip('"')
+                    else:
+                        value = name[start:].rstrip('"')
+                    params[key] = html.unescape(value.strip())
+
+                block["name"] = tool_name
+                block["input"] = params
+                fixed_in_session += 1
+                changed = True
+
+            if changed:
+                lines[idx] = json.dumps(obj, ensure_ascii=False) + "\n"
+
+        if fixed_in_session > 0:
+            path.write_text("".join(lines), encoding="utf-8")
+            total_fixed += fixed_in_session
+            sessions_fixed += 1
+
+    if total_fixed == 0:
+        return "No corrupted tool_use blocks found."
+    return f"Repaired {total_fixed} tool_use block(s) in {sessions_fixed} session(s). Backups created."
+
+
 # ─── Registry ────────────────────────────────────────────────────────────────
 
 # (name, check_fn, fix_fn_or_None)
 ALL_CHECKS: list[tuple[str, callable, callable | None]] = [
     ("trust-dialog-hang", check_trust_dialog_hang, fix_trust_dialog_hang),
+    ("corrupted-tool-use", check_corrupted_tool_use, fix_corrupted_tool_use),
     ("oversized-sessions", check_oversized_sessions, None),
     ("stale-backups", check_stale_backups, fix_stale_backups),
     ("disk-usage", check_disk_usage, None),
