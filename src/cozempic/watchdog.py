@@ -59,6 +59,20 @@ STORM_TRIP = 5
 # The guard's back-off cap (HARD_LOOP_BACKOFF_CAP), recorded for diagnostics.
 BACKOFF_CAP_S = 300
 
+# Rate-based storm detection: time window (seconds) within which daemon restarts
+# are counted. A storm = many restarts close together. 3600s (1h) separates
+# "storming right now" from "user restarting Claude across a day". The daemon's
+# own back-off cap is BACKOFF_CAP_S=300; a storm spanning >1h is either arrested
+# by the daemon's own circuit-breaker or has been running long enough that
+# flagging it is correct.
+RATE_WINDOW_S: int = 3600
+
+# Minimum daemon restarts within RATE_WINDOW_S to declare an error respawn storm.
+# Set to 5, consistent with the existing STORM_TRIP constant for futile-prune storms.
+# Five escalation-respawn cycles happen in < 5 min during a real error loop; user
+# restarts across a day don't cluster within a 1h window.
+RATE_STORM_TRIP: int = 5
+
 # The token-count group must tolerate the suffix guard._fmt_prune_result emits:
 # in practice only "K" (e.g. "210.0K tokens freed") or a bare integer — a 1.2M-token
 # prune renders as "1200.0K", never "1.2M". The regex stays permissive ([KMG]?,
