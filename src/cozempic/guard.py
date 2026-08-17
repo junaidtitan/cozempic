@@ -767,6 +767,12 @@ def start_guard(
     # Resolve Claude before daemonization or other reparenting can obscure it.
     if claude_pid is None:
         claude_pid = find_claude_pid()
+    if claude_pid is None:
+        # Ancestry was already severed (backgrounded hook spawn). Ask which
+        # process holds the transcript instead, so the exit watchdog can arm.
+        claude_pid = _find_owner_pid(session_path)
+        if claude_pid:
+            print(f"  Owner resolved from transcript holders: PID {claude_pid}")
     # Record PID + start_time NOW — earliest point where both claude_pid and
     # session_id are known and Claude's identity is confirmed by find_claude_pid.
     if claude_pid and session_id:
@@ -1004,6 +1010,25 @@ def start_guard(
                 if not session_path.exists():
                     print("  WARNING: Session file disappeared. Stopping guard.")
                     break
+
+                # Ownerless daemons cannot observe a Claude exit, so they
+                # fall back to transcript quiet as the exit signal. Retry
+                # owner resolution first — Claude may have been mid-startup
+                # when this daemon spawned.
+                if not claude_pid:
+                    claude_pid = _find_owner_pid(session_path)
+                    if claude_pid:
+                        print(f"  [{_now()}] Owner resolved late: PID {claude_pid}.")
+                        if session_id:
+                            _record_claude_identity(session_id, claude_pid)
+                    elif _session_is_idle(session_path, OWNERLESS_IDLE_EXIT_SECONDS):
+                        print(
+                            f"  [{_now()}] No owning Claude process and the "
+                            f"transcript has been idle for over "
+                            f"{int(OWNERLESS_IDLE_EXIT_SECONDS // 60)} minutes. "
+                            f"Exiting rather than polling a dead session."
+                        )
+                        break
 
                 # Watchdog: detect Claude exit (workaround for Stop hook not firing)
                 if claude_pid and claude_alive:
@@ -4016,6 +4041,66 @@ def _pid_identity_match(pid: int, session_id: str | None) -> bool:
 # module-level alias so callers in this module and tests that patch
 # ``guard._pid_is_alive`` continue to work without a wrapper call.
 _pid_is_alive = _pid_is_alive_canonical
+
+
+# --- Owner resolution and idle exit -------------------------------------
+#
+# The SessionStart hook backgrounds the spawn (`... &`), so by the time the
+# CLI calls find_claude_pid() its ancestry has often already been reparented
+# away from Claude — find_claude_pid() walks to PID 1 and returns None. With
+# no claude_pid the exit watchdog below never arms, and the daemon polls its
+# transcript forever: guards observed alive 22 days after their session ended.
+#
+# Two independent defences, because either alone leaves a hole:
+#   1. _find_owner_pid — recover the owning Claude by asking which live
+#      process holds this session's transcript open. Restores the watchdog.
+#   2. _session_is_idle — if no owner can be identified at all, exit once the
+#      transcript has gone quiet. A session nobody writes to needs no guard,
+#      so immortality becomes impossible regardless of PID resolution.
+
+OWNERLESS_IDLE_EXIT_SECONDS = 30 * 60
+
+
+def _find_owner_pid(session_path: Path) -> int | None:
+    """Find the live Claude process holding this session's transcript open.
+
+    Used only when ancestry-based detection has already failed. Returns None
+    when lsof is unavailable, times out, or nothing holds the file — callers
+    must treat None as "unknown", never as "Claude exited".
+    """
+    if platform.system() == "Windows":
+        return None
+    try:
+        result = subprocess.run(
+            ["lsof", "-t", str(session_path)],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for line in (result.stdout or "").split():
+        try:
+            pid = int(line.strip())
+        except ValueError:
+            continue
+        # The guard itself may hold the transcript; only Claude counts.
+        if pid == os.getpid():
+            continue
+        if _is_claude_process(pid, session_path=session_path):
+            return pid
+    return None
+
+
+def _session_is_idle(session_path: Path, max_idle_seconds: float) -> bool:
+    """True when the transcript has not been written for max_idle_seconds.
+
+    A missing file is not idle — the caller has a separate branch for that,
+    and reporting idle here would conflate "gone" with "quiet".
+    """
+    try:
+        age = time.time() - session_path.stat().st_mtime
+    except OSError:
+        return False
+    return age > max_idle_seconds
 
 
 def _is_claude_process(pid: int, session_path: Path | None = None) -> bool:
