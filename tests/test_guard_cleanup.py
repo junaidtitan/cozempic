@@ -179,6 +179,7 @@ class TestPidIsAliveCanonicalBehavior(unittest.TestCase):
             # canonical: return os.name != "nt" → True on POSIX
             self.assertTrue(_canonical_pid_is_alive(99999))
 
+    @unittest.skipUnless(os.name == "nt", "Windows-only: with os.name patched to nt the probe is the native ctypes OpenProcess path, which cannot import on POSIX")
     def test_windows_oserror_returns_false(self):
         """Windows OSError on os.kill(pid, 0) → dead."""
         with (

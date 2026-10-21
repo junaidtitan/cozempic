@@ -17,6 +17,7 @@ that branch on a POSIX host would raise AttributeError unrelated to the logic.
 from __future__ import annotations
 
 import tempfile
+import os
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -57,6 +58,7 @@ class TestIsGuardRunningWindowsOSError(unittest.TestCase):
         self.pid_path = Path(self._tmp.name) / "cozempic_guard_test.pid"
         self.pid_path.write_text("424242")  # plausible, > 0 pid
 
+    @unittest.skipUnless(os.name == "nt", "Windows-only: with os.name patched to nt the probe is the native ctypes OpenProcess path, which cannot import on POSIX")
     def test_windows_oserror_treated_as_dead(self):
         # WinError 87 surfaces as a bare OSError (errno EINVAL), not
         # ProcessLookupError — must be treated as "no daemon", returning None.
