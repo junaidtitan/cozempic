@@ -74,7 +74,13 @@ class TestReloadWritesInFlightSentinel(unittest.TestCase):
         # actually terminating a live Claude and resuming it. _terminate_and_resume
         # has an anti-resurrection entry gate (skips everything, incl. the
         # sentinel write, if claude_pid is no longer a Claude process).
+        # The terminal is pinned to "plain" on purpose. Left real, this test
+        # inherits whatever terminal it runs in; under tmux it used to send
+        # "/exit" to the pane that was running it (2026-10-21), and the pane
+        # was a live Claude Code session. The assertion here is about sentinel
+        # ordering, which the plain path exercises just the same.
         with patch("cozempic.guard._spawn_reload_watcher", side_effect=_fake_watcher), \
+             patch("cozempic.guard._detect_terminal_env", return_value="plain"), \
              patch("cozempic.guard._is_claude_process", return_value=True), \
              patch("cozempic.guard._wait_for_exit", return_value=True), \
              patch("cozempic.guard.os.kill"), \

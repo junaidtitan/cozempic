@@ -2197,6 +2197,56 @@ def _wait_for_exit(pid: int, timeout: float = 5.0) -> bool:
     return False
 
 
+def _tmux_pane_owns_pid(pane: str, pid: int) -> bool:
+    """True only if `pane` is a real tmux pane whose process tree contains `pid`.
+
+    `tmux send-keys` types into whatever pane it is pointed at. The pane we
+    point at comes from TMUX_PANE, which is inherited by every descendant of
+    the shell that pane runs, including a test runner or a tool call executed
+    by the Claude that owns the pane. On 2026-10-21 a test suite run from
+    inside a Claude Code session resolved TMUX_PANE to that session's own pane
+    and typed "/exit" into it, four times, each a clean self-termination that
+    looked like a crash to every watcher. The PID the caller passed was a
+    fixture value; nothing checked that the pane and the PID belonged together.
+
+    So: before any keystroke, prove the target PID is the pane's own process or
+    one of its descendants. No pane, no proof, or any error → False. Fails
+    CLOSED, because the cost of a wrong keystroke is a dead session and the
+    cost of a refusal is one skipped reload that the next poll can retry.
+    """
+    if not pane or pid <= 0:
+        return False
+    try:
+        result = subprocess.run(
+            ["tmux", "display-message", "-p", "-t", pane, "#{pane_pid}"],
+            capture_output=True, text=True, timeout=3, check=False,
+        )
+        if result.returncode != 0:
+            return False
+        pane_pid = int((result.stdout or "").strip())
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return False
+    if pane_pid <= 1:
+        return False
+    # Walk up from pid; the pane's shell (or Claude itself, when tmux ran it
+    # directly) must appear within a short ancestry.
+    cur = pid
+    for _ in range(12):
+        if cur == pane_pid:
+            return True
+        try:
+            out = subprocess.run(
+                ["ps", "-o", "ppid=", "-p", str(cur)],
+                capture_output=True, text=True, timeout=3, check=False,
+            ).stdout.strip()
+            cur = int(out)
+        except (subprocess.SubprocessError, OSError, ValueError):
+            return False
+        if cur <= 1:
+            return False
+    return False
+
+
 def _terminate_and_resume(
     claude_pid: int,
     project_dir: str,
@@ -2281,6 +2331,18 @@ def _terminate_and_resume(
         if not _is_claude_process(claude_pid, session_path=session_path):
             print(f"  WARNING: PID {claude_pid} is no longer a Claude process — skipping tmux terminate+resume.")
             return
+        # The pane must be the one that runs THIS Claude. TMUX_PANE is inherited
+        # by everything the pane's shell spawns, so a stale or foreign value
+        # would type "/exit" into somebody else's session (see
+        # _tmux_pane_owns_pid). Checked before the sentinel write so a refusal
+        # leaks nothing.
+        pane = os.environ.get("TMUX_PANE", "")
+        if not _tmux_pane_owns_pid(pane, claude_pid):
+            print(
+                f"  WARNING: tmux pane {pane or '(unset)'} does not own PID {claude_pid} — "
+                "refusing to send keystrokes; skipping terminate+resume."
+            )
+            return
         # PID check passed — we ARE going to terminate + auto-resume. Write the
         # sentinel BEFORE send-keys so the resumed Claude's SessionStart hook
         # sees it and skips the daemon spawn during the resume window.
@@ -2289,7 +2351,6 @@ def _terminate_and_resume(
                 write_reload_sentinel(session_id, claude_pid)
             except OSError:
                 pass  # best-effort; stale-GC clears any leaked sentinel
-        pane = os.environ.get("TMUX_PANE", "")
         target = f"-t {pane}" if pane else ""
         print(f"  tmux detected — sending /exit and auto-resuming in same pane...")
 
