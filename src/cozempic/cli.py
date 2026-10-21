@@ -904,6 +904,13 @@ def cmd_reload(args):
 
         if term_env == "tmux":
             pane = os.environ.get("TMUX_PANE", "")
+            from .guard import _tmux_pane_owns_pid
+            if not _tmux_pane_owns_pid(pane, claude_pid):
+                # Same confused-deputy guard as guard._terminate_and_resume: a
+                # keystroke into a pane we cannot prove is ours kills a stranger.
+                print(f"  tmux pane {pane or '(unset)'} does not own PID {claude_pid} — not sending /exit.")
+                print("  Restart Claude manually with: claude --resume")
+                return
             import subprocess as sp
             sp.run(["tmux", "send-keys", *(["-t", pane] if pane else []), "/exit", "Enter"],
                    capture_output=True, timeout=5)
