@@ -158,6 +158,7 @@ class TestPidIsAliveCanonicalBehavior(unittest.TestCase):
         with patch("os.kill", side_effect=ProcessLookupError):
             self.assertFalse(_canonical_pid_is_alive(99999))
 
+    @unittest.skipIf(os.name == "nt", "POSIX os.kill seam — Windows uses the native OpenProcess probe (see tests/test_windows_lifecycle.py)")
     def test_permission_error_returns_true(self):
         """PermissionError: process exists but owned by another user — alive."""
         with patch("os.kill", side_effect=PermissionError):
@@ -178,6 +179,7 @@ class TestPidIsAliveCanonicalBehavior(unittest.TestCase):
             # canonical: return os.name != "nt" → True on POSIX
             self.assertTrue(_canonical_pid_is_alive(99999))
 
+    @unittest.skipUnless(os.name == "nt", "Windows-only: with os.name patched to nt the probe is the native ctypes OpenProcess path, which cannot import on POSIX")
     def test_windows_oserror_returns_false(self):
         """Windows OSError on os.kill(pid, 0) → dead."""
         with (
