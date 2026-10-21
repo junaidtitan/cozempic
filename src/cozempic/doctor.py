@@ -1219,7 +1219,6 @@ def check_cozempic_daemon_running() -> CheckResult:
     stranger process doesn't produce a false-positive "daemon running".
     """
     import os as _os
-    from .guard import _is_cozempic_guard_process
     from pathlib import Path as _Path
     import glob as _glob
     from .guard import _is_cozempic_guard_process, _kill0_probe
